@@ -320,6 +320,7 @@ class TunisiaNetSite(BaseSite):
     # ---------------------------------
     # FULL SCRAPER
     # ---------------------------------
+
     def scrape_site(self):
 
         logger.info(f"{self.name} | SCRAPE_START")
@@ -330,6 +331,9 @@ class TunisiaNetSite(BaseSite):
 
         total_categories = len(CATEGORIES)
 
+        # ---------------------------------
+        # CATEGORY SCRAPING
+        # ---------------------------------
         for i, (category_name, category_url) in enumerate(CATEGORIES.items(), start=1):
 
             category_results = self.scrape_category(
@@ -343,20 +347,46 @@ class TunisiaNetSite(BaseSite):
             results.extend(category_results)
 
         logger.info(
-            f"{self.name} | SCRAPE_FINISHED | total_products={len(results)}"
+            f"{self.name} | CATEGORY_PHASE_DONE | collected={len(results)}"
         )
         log_global(
-            f"{self.name} | SCRAPE_FINISHED | total_products={len(results)}"
+            f"{self.name} | CATEGORY_PHASE_DONE | collected={len(results)}"
+        )
+
+        # ---------------------------------
+        # BRAND SCRAPING (FALLBACK)
+        # ---------------------------------
+        brand_results = self.scrape_brands(seen_products)
+
+        results.extend(brand_results)
+
+        logger.info(
+            f"{self.name} | BRAND_PHASE_DONE | collected={len(brand_results)}"
+        )
+        log_global(
+            f"{self.name} | BRAND_PHASE_DONE | collected={len(brand_results)}"
+        )
+
+        # ---------------------------------
+        # FINAL STATS
+        # ---------------------------------
+        total_products = len(results)
+
+        logger.info(
+            f"{self.name} | SCRAPE_FINISHED | total_products={total_products}"
+        )
+        log_global(
+            f"{self.name} | SCRAPE_FINISHED | total_products={total_products}"
         )
 
         print("\n=================================")
         print(f" SCRAPING FINISHED : {self.name}")
-        print(f" TOTAL PRODUCTS    : {len(results)}")
+        print(f" TOTAL PRODUCTS    : {total_products}")
         print("=================================\n")
 
         return {
             "site": self.name,
-            "total_products": len(results),
+            "total_products": total_products,
             "products": results
         }
     
@@ -364,6 +394,7 @@ class TunisiaNetSite(BaseSite):
     # ---------------------------------
     # CATEGORY DISCOVERY
     # ---------------------------------
+    
     def extract_categories(self):
 
         logger.info(f"{self.name} | CATEGORY_DISCOVERY_START")
