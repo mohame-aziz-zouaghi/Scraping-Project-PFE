@@ -6,7 +6,7 @@ class PerformanceTracker:
         self.start_time = time.time()
         self.total_products = 0
 
-    def add_product(self):
+    def add_product(self,count=1):
         self.total_products += 1
 
     def get_speed(self):
