@@ -72,9 +72,12 @@ def menu():
 
             products = site.search(query)
 
-            print(f"\n Found {(products)["total_results"]} products \n")
+            if products :
+                print(f"\n Found {(products)["total_results"]} products \n")
+                logger.info(f"CLI | search_completed | {site.name} | {query}")
+            else : 
+                print("\n FEATURE_NOT_IMPLEMENTED_YET | ERROR HAPPENED ! \n")
 
-            logger.info(f"CLI | search_completed | {site.name} | {query}")
 
 
         elif choice == "3":
@@ -87,7 +90,10 @@ def menu():
 
             product = site.parse_product(url,None)
 
-            print(json.dumps(product, indent=4, ensure_ascii=False))
+            if product :
+                print(json.dumps(product, indent=4, ensure_ascii=False))
+            else : 
+                print("\n FEATURE_NOT_IMPLEMENTED_YET | ERROR HAPPENED ! \n")
 
         elif choice == "4":
 
