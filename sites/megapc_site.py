@@ -1,0 +1,237 @@
+# sites/megapc.py
+
+import os
+import requests
+from tqdm import tqdm
+
+from core.logger import setup_logger, write_product_result, log_global
+from core.product_schema import create_product_schema
+from core.performance import PerformanceTracker
+
+from parsers.megapc.megapc_products_parser import parse_megapc_products
+from parsers.megapc.megapc_product_details_parser import parse_megapc_product_details
+
+from config.categoriesMegaPC import CATEGORIES
+from sites.base_site import BaseSite
+
+
+logger = setup_logger("megapc", "scraper")
+
+
+class MegaPCSite(BaseSite):
+
+    def __init__(self):
+        self.name = "MEGAPC"
+        self.performance = PerformanceTracker()
+
+        self.api_products = "https://apiclt.gi-ga.tech/produit/byPaginationNew"
+        self.base_next = "https://megapc.tn/_next/data/build-1757602359699"
+
+    # ---------------------------------
+    # API PRODUCTS
+    # ---------------------------------
+    def get_products(self, category, subcategory):
+
+        payload = {
+            "recordByPage": 1000,
+            "pageNumber": "1",
+            "categorie": {"titre": category},
+            "filscateg": {"titre": subcategory},
+            "page": 1,
+            "price": {"$gte": 0, "$lte": 999999},
+            "query": None,
+            "brand": [],
+            "valeurAttribute1": []
+        }
+
+        try:
+            res = requests.post(self.api_products, json=payload, timeout=15)
+
+            if res.status_code != 200:
+                logger.warning(f"{self.name} | API_FAIL | {category} > {subcategory} | status={res.status_code}")
+                return []
+
+            # 🔍 DEBUG RAW RESPONSE
+            try:
+                data = res.json()
+            except Exception:
+                logger.error(f"{self.name} | INVALID_JSON | {category} > {subcategory}")
+                print("RAW RESPONSE:", res.text[:500])  # show first 500 chars
+                return []
+
+            # 🛑 SAFETY CHECK
+            if not isinstance(data, dict):
+                logger.error(f"{self.name} | UNEXPECTED_RESPONSE_TYPE | {type(data)}")
+                return []
+
+            raw_products = data.get("products", [])
+
+            if not isinstance(raw_products, list):
+                logger.error(f"{self.name} | PRODUCTS_NOT_LIST | type={type(raw_products)}")
+                return []
+
+            logger.info(
+                f"{self.name} | RAW_PRODUCTS | {category} > {subcategory} | count={len(raw_products)}"
+            )
+
+            products = parse_megapc_products(raw_products)
+
+            logger.info(
+                f"{self.name} | PARSED_PRODUCTS | {category} > {subcategory} | count={len(products)}"
+            )
+
+            return products
+
+        except Exception as e:
+            logger.error(f"{self.name} | API_ERROR | {category} > {subcategory} | {e}")
+            return []
+
+    # ---------------------------------
+    # PRODUCT DETAILS
+    # ---------------------------------
+    def get_product_details(self, category, subcategory, slug):
+
+        if not slug:
+            return {}
+
+        cat_param = category.replace(" ", "+")
+        sub_param = subcategory.replace(" ", "+")
+
+        cat_path = category.replace(" ", "%20")
+        sub_path = subcategory.replace(" ", "%20")
+
+        url = (
+            f"{self.base_next}/shop/product/"
+            f"{cat_path}/{sub_path}/{slug}.json"
+            f"?lien={cat_param}&lien={sub_param}&lien={slug}"
+        )
+
+        try:
+            res = requests.get(url, timeout=10)
+
+            if res.status_code != 200:
+                logger.warning(f"{self.name} | DETAILS_FAIL | {slug}")
+                return {}
+
+            return parse_megapc_product_details(res.json())
+
+        except Exception as e:
+            logger.error(f"{self.name} | DETAILS_ERROR | {slug} | {e}")
+            return {}
+
+    # ---------------------------------
+    # BUILD PRODUCT
+    # ---------------------------------
+    def build_product(self, base, details, url):
+
+        product = create_product_schema(self.name, url, base.get("id"))
+
+        print ("\n 11 \n")
+        product["name"] = base.get("name")
+        product["brand"] = base.get("brand")
+        product["category"] = base.get("category")
+        print ("\n 12 \n")
+
+        price = base.get("price") or 0
+        promo = base.get("prixEnPromo") or 0
+
+        product["price"] = price
+        product["discount_price"] = promo if promo < price else 0
+        product["discount_amount"] = (price - promo) if promo and promo < price else 0
+
+        product["availability"] = "InStock" if base.get("stock", 0) > 0 else "OutOfStock"
+        product["special_id"] = details.get("sku")
+
+        if details:
+
+            product["description"] = details.get("description")
+
+            short = details.get("short_description")
+
+            if isinstance(short, list):
+                product["short_description"] = short
+            elif isinstance(short, str):
+                product["short_description"] = [short]
+
+            images = details.get("images", [])
+            product["images"] = images
+
+            if images:
+                product["main_image"] = images[0]
+
+        product["price_valid_until"] = details.get("priceValidUntil")
+
+        return product
+
+    # ---------------------------------
+    # MAIN SCRAPER
+    # ---------------------------------
+    def scrape_site(self):
+
+        logger.info(f"{self.name} | SCRAPE_START")
+        log_global(f"{self.name} | SCRAPE_START")
+
+        results = []
+        count = 0
+
+        for cat, subs in CATEGORIES.items():
+
+            for sub in subs:
+
+                logger.info(f"{self.name} | CATEGORY | {cat} > {sub}")
+
+                products = self.get_products(cat, sub)
+                print(f"\n {products} \n")
+
+                if not products:
+                    logger.warning(f"{self.name} | NO_PRODUCTS | {cat} > {sub}")
+                    continue
+
+                for p in tqdm(products, desc=f"{cat} | {sub}"):
+
+                    try:
+                        slug = p.get("slug")
+
+                        if not slug:
+                            logger.warning(f"{self.name} | SKIP_NO_SLUG")
+                            continue
+
+
+
+                        url = f"https://megapc.tn/shop/product/{cat}/{sub}/{slug}"
+
+
+                        details = self.get_product_details(cat, sub, slug)
+
+                        final = self.build_product(p, details, url)
+
+
+                        if not final.get("name"):
+                            logger.warning(f"{self.name} | INVALID_PRODUCT | {slug}")
+                            continue
+
+                        write_product_result(final, self.name)
+                        results.append(final)
+
+                        count += 1
+                        self.performance.add_product()
+
+                        # # ✅ DEBUG CHECKPOINT BACK
+                        # if count % 5 == 0:
+                        #     print("\n======================")
+                        #     print(f"{count} products scraped")
+                        #     cont = input("Continue? (y/n): ").strip().lower()
+                        #     print("======================\n")
+
+                        #     if cont != "y":
+                        #         logger.info(f"{self.name} | STOP_BY_USER | {count}")
+                        #         return results
+
+                    except Exception as e:
+                        logger.error(f"{self.name} | PRODUCT_ERROR | {e}")
+                        continue
+
+        logger.info(f"{self.name} | SCRAPE_DONE | total={len(results)}")
+        log_global(f"{self.name} | SCRAPE_DONE | total={len(results)}")
+
+        return results
