@@ -1,7 +1,9 @@
 # sites/megapc.py
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import re
+import threading
 from bs4 import BeautifulSoup
 import requests
 from tqdm import tqdm
@@ -20,7 +22,7 @@ from sites.base_site import BaseSite
 
 
 logger = setup_logger("megapc", "scraper")
-
+dup_logger = setup_logger("megapc", "duplication")
 
 class MegaPCSite(BaseSite):
 
@@ -178,6 +180,9 @@ class MegaPCSite(BaseSite):
     # ---------------------------------
     # MAIN SCRAPER
     # ---------------------------------
+
+
+
     def scrape_site(self):
 
         logger.info(f"{self.name} | SCRAPE_START")
@@ -186,7 +191,17 @@ class MegaPCSite(BaseSite):
         results = []
         count = 0
 
-        for cat, subs in CATEGORIES.items():
+        seen_products = {}
+        lock = threading.Lock()
+
+        total_categories = len(CATEGORIES)
+
+        # =========================
+        # CATEGORY LOOP PROGRESS
+        # =========================
+        for i, (cat, subs) in enumerate(CATEGORIES.items(), start=1):
+
+            print(f"\n📦 CATEGORY {i}/{total_categories} -> {cat}\n")
 
             for sub in subs:
 
@@ -198,27 +213,67 @@ class MegaPCSite(BaseSite):
                     logger.warning(f"{self.name} | NO_PRODUCTS | {cat} > {sub}")
                     continue
 
-                for p in tqdm(products, desc=f"{cat} | {sub}"):
+                # =========================
+                # WORKER FUNCTION
+                # =========================
+                def process_product(p):
+
+                    nonlocal seen_products, lock
 
                     try:
                         slug = p.get("slug")
 
                         if not slug:
                             logger.warning(f"{self.name} | SKIP_NO_SLUG")
-                            continue
+                            return None
 
+                        # -------------------------
+                        # DUPLICATION CHECK (THREAD SAFE)
+                        # -------------------------
+                        with lock:
+                            if slug in seen_products:
+                                dup_logger.warning(
+                                    f"{self.name} | DUPLICATE | {slug}"
+                                )
+                                return None
 
+                            seen_products[slug] = True
 
                         url = f"https://megapc.tn/shop/product/{cat}/{sub}/{slug}"
-
 
                         details = self.get_product_details(cat, sub, slug)
 
                         final = self.build_product(p, details, url)
 
-
                         if not final.get("name"):
                             logger.warning(f"{self.name} | INVALID_PRODUCT | {slug}")
+                            return None
+
+                        return final
+
+                    except Exception as e:
+                        logger.error(f"{self.name} | PRODUCT_ERROR | {e}")
+                        return None
+
+                # =========================
+                # THREADPOOL EXECUTION
+                # =========================
+                with ThreadPoolExecutor(max_workers=5) as executor:
+
+                    futures = [
+                        executor.submit(process_product, p)
+                        for p in products
+                    ]
+
+                    for future in tqdm(
+                        as_completed(futures),
+                        total=len(futures),
+                        desc=f"{cat} | {sub}"
+                    ):
+
+                        final = future.result()
+
+                        if not final:
                             continue
 
                         write_product_result(final, self.name)
@@ -227,23 +282,7 @@ class MegaPCSite(BaseSite):
                         count += 1
                         self.performance.add_product()
 
-                        # ✅ DEBUG CHECKPOINT BACK
-                        if count % 5 == 0:
-                            print("\n======================")
-                            print(f"{count} products scraped")
-                            cont = input("Continue? (y/n): ").strip().lower()
-                            print("======================\n")
-
-                            if cont != "y":
-                                logger.info(f"{self.name} | STOP_BY_USER | {count}")
-                                return results
-
-                    except Exception as e:
-                        logger.error(f"{self.name} | PRODUCT_ERROR | {e}")
-                        continue
-
         logger.info(f"{self.name} | SCRAPE_DONE | total={len(results)}")
         log_global(f"{self.name} | SCRAPE_DONE | total={len(results)}")
 
         return results
-    
