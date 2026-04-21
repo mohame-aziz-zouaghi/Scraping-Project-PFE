@@ -1,9 +1,13 @@
 # sites/megapc.py
 
 import os
+import re
+from bs4 import BeautifulSoup
 import requests
 from tqdm import tqdm
 
+from core.Dclean_html import clean_html
+from core.clean_parse_specs import parse_specs
 from core.logger import setup_logger, write_product_result, log_global
 from core.product_schema import create_product_schema
 from core.performance import PerformanceTracker
@@ -126,11 +130,9 @@ class MegaPCSite(BaseSite):
 
         product = create_product_schema(self.name, url, base.get("id"))
 
-        print ("\n 11 \n")
         product["name"] = base.get("name")
         product["brand"] = base.get("brand")
         product["category"] = base.get("category")
-        print ("\n 12 \n")
 
         price = base.get("price") or 0
         promo = base.get("prixEnPromo") or 0
@@ -144,20 +146,30 @@ class MegaPCSite(BaseSite):
 
         if details:
 
-            product["description"] = details.get("description")
+            # -------------------------
+            # DESCRIPTION → CLEAN TEXT ONLY
+            # -------------------------
+            product["description"] = clean_html(
+                details.get("description")
+            )
 
-            short = details.get("short_description")
+            # -------------------------
+            # SHORT DESCRIPTION → KEY/VALUE STRUCTURE
+            # -------------------------
+            product["short_description"] = parse_specs(
+                details.get("short_description", [])
+            )
 
-            if isinstance(short, list):
-                product["short_description"] = short
-            elif isinstance(short, str):
-                product["short_description"] = [short]
-
+            # -------------------------
+            # IMAGES
+            # -------------------------
             images = details.get("images", [])
-            product["images"] = images
+            product["images"] = [
+                img for img in images if isinstance(img, str)
+            ]
 
-            if images:
-                product["main_image"] = images[0]
+            if product["images"]:
+                product["main_image"] = product["images"][0]
 
         product["price_valid_until"] = details.get("priceValidUntil")
 
@@ -181,7 +193,6 @@ class MegaPCSite(BaseSite):
                 logger.info(f"{self.name} | CATEGORY | {cat} > {sub}")
 
                 products = self.get_products(cat, sub)
-                print(f"\n {products} \n")
 
                 if not products:
                     logger.warning(f"{self.name} | NO_PRODUCTS | {cat} > {sub}")
@@ -216,16 +227,16 @@ class MegaPCSite(BaseSite):
                         count += 1
                         self.performance.add_product()
 
-                        # # ✅ DEBUG CHECKPOINT BACK
-                        # if count % 5 == 0:
-                        #     print("\n======================")
-                        #     print(f"{count} products scraped")
-                        #     cont = input("Continue? (y/n): ").strip().lower()
-                        #     print("======================\n")
+                        # ✅ DEBUG CHECKPOINT BACK
+                        if count % 5 == 0:
+                            print("\n======================")
+                            print(f"{count} products scraped")
+                            cont = input("Continue? (y/n): ").strip().lower()
+                            print("======================\n")
 
-                        #     if cont != "y":
-                        #         logger.info(f"{self.name} | STOP_BY_USER | {count}")
-                        #         return results
+                            if cont != "y":
+                                logger.info(f"{self.name} | STOP_BY_USER | {count}")
+                                return results
 
                     except Exception as e:
                         logger.error(f"{self.name} | PRODUCT_ERROR | {e}")
@@ -235,3 +246,4 @@ class MegaPCSite(BaseSite):
         log_global(f"{self.name} | SCRAPE_DONE | total={len(results)}")
 
         return results
+    
