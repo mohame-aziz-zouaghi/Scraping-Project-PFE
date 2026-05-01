@@ -6,6 +6,25 @@ from core.product_schema import create_product_schema
 
 logger = setup_logger(site_name="sbs", log_type="scraper")
 
+def clean_price(val):
+    if not val:
+        return None
+
+    try:
+        val = str(val)
+
+        val = val.replace("TND", "").replace("DT", "")
+        val = val.replace("\xa0", " ").strip()
+
+        # SBS uses comma as decimal separator → convert to dot
+        val = val.replace(",", ".")
+
+        return float(val)
+
+    except Exception as e:
+        print(f"PRICE CLEAN ERROR: {val} | {e}")
+        return None
+
 def parse_sbs_product_page(html, url, site, main_product_id=None):
 
     soup = BeautifulSoup(html, "lxml")
@@ -107,24 +126,37 @@ def parse_sbs_product_page(html, url, site, main_product_id=None):
 
             product["short_description"].append(li.text.strip())
 
+
+
+
     # ---------------------------------
-    # DISCOUNT
+    # PRICE LOGIC (BASED ON YOUR RULES)
     # ---------------------------------
+
+    # original price from JSON
+    original_price = clean_price(product.get("price"))
 
     discount_block = soup.select_one(".product-price.has-discount")
 
     if discount_block:
 
-        discount_price = soup.select_one(".product-discount .regular-price")
+        # discounted price from HTML
+        discounted_el = soup.select_one(".product-discount .regular-price")
+        discounted_price = clean_price(discounted_el.text if discounted_el else None)
 
-        discount_amount = soup.select_one(".discount-amount")
 
-        if discount_price:
-            product["discount_price"] = discount_price.text.strip()
+        if discounted_price:
+            product["price"] = discounted_price              # ✅ main price = discounted
+            product["discount_price"] = original_price       # ✅ original price
 
-        if discount_amount:
-            product["discount_amount"] = discount_amount.text.strip()
+            if original_price:
+                product["discount_amount"] =  discounted_price - original_price
 
+    else:
+        # no discount → keep original JSON price
+        product["price"] = original_price
+        product["discount_price"] = None
+        product["discount_amount"] = None
     # ---------------------------------
     # LOG SUCCESS
     # ---------------------------------
@@ -132,3 +164,4 @@ def parse_sbs_product_page(html, url, site, main_product_id=None):
         logger.info(f"{site} | PRODUCT_PARSED_SUCCESSFULLY | {product['name']}")
 
     return product
+

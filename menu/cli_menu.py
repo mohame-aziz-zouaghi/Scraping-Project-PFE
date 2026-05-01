@@ -1,7 +1,10 @@
 import json
+import locale
+import sys
 from parsers.tunisianet.debug_tunisianet_product import extract_and_clean_tunisianet_product
 from sites.loader import load_sites
 from core.logger import setup_logger
+from DB.load_data_db import run
 
 sites = load_sites()
 logger = setup_logger()
@@ -60,6 +63,10 @@ def choose_site():
 # ---------------------------------
 def menu():
 
+    print("\n=== SYSTEM DEBUG START ===")
+    print("Python encoding:", sys.getdefaultencoding())
+    print("Locale encoding:", locale.getpreferredencoding())
+    print("==========================\n")
     while True:
 
         print_header("SCRAPER MAIN MENU")
@@ -69,6 +76,7 @@ def menu():
         print("3 - Parse Product by URL")
         print("4 - Extract Categories")
         print("5 - Debug Tunisianet Product")
+        print("10 - Load Data Into DB")
         print("0 - Exit")
 
         choice = input("\nChoice: ").strip()
@@ -138,6 +146,13 @@ def menu():
             print_success("Running debug parser...")
             extract_and_clean_tunisianet_product(url)
 
+        # ---------------------------------
+        # Loading Data into the DB
+        # ---------------------------------
+        elif choice == "10":
+            logger.info("CLI | Loading Data Started ! ")
+            run()
+            logger.info("CLI | Loading Data Competed ! ")
         # ---------------------------------
         # EXIT
         # ---------------------------------
