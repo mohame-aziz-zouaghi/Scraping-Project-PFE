@@ -1,6 +1,8 @@
 import json
 import locale
 import sys
+from core.cache.product_cache import ProductCache
+from monitoring.preload_cache import preload_cache
 from parsers.tunisianet.debug_tunisianet_product import extract_and_clean_tunisianet_product
 from sites.loader import load_sites
 from core.logger import setup_logger
@@ -77,6 +79,8 @@ def menu():
         print("4 - Extract Categories")
         print("5 - Debug Tunisianet Product")
         print("10 - Load Data Into DB")
+        print("11 - Test Redis")
+        print("12 - Preoading Data to Redis")
         print("0 - Exit")
 
         choice = input("\nChoice: ").strip()
@@ -153,6 +157,38 @@ def menu():
             logger.info("CLI | Loading Data Started ! ")
             run()
             logger.info("CLI | Loading Data Competed ! ")
+
+        # ---------------------------------
+        # Testing Redis
+        # ---------------------------------
+
+        elif choice == "11":
+            logger.info ("CLi | Testing Redis")
+            cache = ProductCache()
+
+            product = {
+                "price": 500,
+                "availability": "InStock",
+                "special_id": "ABC123",
+                "price_valid_until": "2027-01-01"
+            }
+
+            cache.set_product("MEGAPC", "123", product)
+
+            print(
+                cache.get_product("MEGAPC", "123")
+            )
+
+
+        # ---------------------------------
+        # Prelloading Data into Redis 
+        # ---------------------------------
+
+        elif choice == "12":
+            logger.info("CLI | Preloading Data Into Redis Started ")
+            preload_cache()
+            logger.info("CLI | Preloading Data Into Redis Completed Succesfully ")
+
         # ---------------------------------
         # EXIT
         # ---------------------------------

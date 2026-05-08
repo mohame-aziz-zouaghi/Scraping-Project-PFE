@@ -173,3 +173,52 @@ class Database:
         """
 
         execute_batch(cursor, query, rows, page_size=100)
+
+
+    # ---------------------------------
+    # LOAD PRODUCTS FOR MONITORING
+    # ---------------------------------
+    def load_products_for_monitoring(self, limit=None):
+
+        cursor = self.conn.cursor()
+
+        query = """
+        SELECT
+            id,
+            site,
+            url,
+            special_id,
+            price_valid_until,
+            availability,
+            price,
+            discount_price,
+            discount_amount
+        FROM products
+        """
+
+        if limit:
+            query += f" LIMIT {limit}"
+
+        cursor.execute(query)
+
+        rows = cursor.fetchall()
+
+        cursor.close()
+
+        products = []
+
+        for row in rows:
+
+            products.append({
+                "id": row[0],
+                "site": row[1],
+                "url": row[2],
+                "special_id": row[3],
+                "price_valid_until": row[4],
+                "availability": row[5],
+                "price": row[6],
+                "discount_price": row[7],
+                "discount_amount": row[8]
+            })
+
+        return products
