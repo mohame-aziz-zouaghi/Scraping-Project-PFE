@@ -4,7 +4,7 @@ from bs4 import BeautifulSoup
 import threading
 import os
 
-from core.http_client import get
+from core.Web.http_client import get
 from core.logger import setup_logger, write_product_result, log_global
 
 from parsers.sbs.sbs_search_parser import parse_products

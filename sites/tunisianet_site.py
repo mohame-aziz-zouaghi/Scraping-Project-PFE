@@ -1,4 +1,4 @@
-from core.http_client import get
+from core.Web.http_client import get
 from core.logger import setup_logger, write_product_result, log_global
 import os
 import time

@@ -8,10 +8,10 @@ from bs4 import BeautifulSoup
 import requests
 from tqdm import tqdm
 
-from core.Dclean_html import clean_html
-from core.clean_parse_specs import parse_specs
+from core.utils.Dclean_html import clean_html
+from core.utils.clean_parse_specs import parse_specs
 from core.logger import setup_logger, write_product_result, log_global
-from core.product_schema import create_product_schema
+from core.Web.product_schema import create_product_schema
 from core.performance import PerformanceTracker
 
 from parsers.megapc.megapc_products_parser import parse_megapc_products

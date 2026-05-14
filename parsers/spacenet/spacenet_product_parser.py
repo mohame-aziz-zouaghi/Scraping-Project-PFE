@@ -5,8 +5,8 @@ import re
 from bs4 import BeautifulSoup
 from datetime import datetime
 from core.logger import setup_logger
-from core.price_parser import parse_price
-from core.product_schema import create_product_schema
+from core.utils.price_parser import parse_price
+from core.Web.product_schema import create_product_schema
 
 logger = setup_logger("spacenet", "scraper")
 

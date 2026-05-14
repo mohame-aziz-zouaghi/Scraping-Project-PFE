@@ -1,8 +1,10 @@
+import json
+
 import psycopg2
 from psycopg2.extras import Json, execute_batch
 from datetime import datetime
 
-from DB.config import DBConfig
+from Database.Postgresql.config import DBConfig
 
 
 
@@ -222,3 +224,166 @@ class Database:
             })
 
         return products
+    
+
+    def update_monitoring_fields(
+        self,
+        product_id,
+        old_data,
+        new_data,
+        source=None
+    ):
+        cursor = self.conn.cursor()
+        
+        try:
+            # Tracked fields
+            tracked_fields = [
+                "price",
+                "discount_price",
+                "discount_amount",
+                "availability",
+                "special_id",
+                "price_valid_until"
+            ]
+            
+            changed_fields = []
+            
+            # Detect changes
+            for field in tracked_fields:
+                old_value = old_data.get(field) if old_data else None
+                new_value = new_data.get(field) if new_data else None
+                
+                # Normalize numeric values for comparison
+                if field in ["price", "discount_price", "discount_amount"]:
+                    if old_value is not None:
+                        old_value = float(old_value)
+                    if new_value is not None:
+                        new_value = float(new_value)
+                
+                # Normalize dates
+                if field == "price_valid_until":
+                    if old_value:
+                        old_value = str(old_value).split("T")[0].strip()
+                    if new_value:
+                        new_value = str(new_value).split("T")[0].strip()
+                
+                print(f"[DEBUG] Field: {field} - Old: '{old_value}' - New: '{new_value}'")
+                
+                if old_value != new_value:
+                    changed_fields.append({
+                        "field": field,
+                        "old": old_value,
+                        "new": new_value
+                    })
+                    print(f"[DEBUG] CHANGE DETECTED: {field}")
+            
+            # No changes
+            if not changed_fields:
+                print(f"[DEBUG] No changes detected for product {product_id}")
+                return False
+            
+            print(f"[DEBUG] Total changes: {len(changed_fields)}")
+            
+            # Update products table
+            cursor.execute(
+                """
+                UPDATE products
+                SET
+                    price = %s,
+                    discount_price = %s,
+                    discount_amount = %s,
+                    availability = %s,
+                    special_id = %s,
+                    price_valid_until = %s
+                WHERE id = %s
+                """,
+                (
+                    new_data.get("price"),
+                    new_data.get("discount_price"),
+                    new_data.get("discount_amount"),
+                    new_data.get("availability"),
+                    new_data.get("special_id"),
+                    new_data.get("price_valid_until"),
+                    product_id
+                )
+            )
+            
+            # Check if price-related fields changed
+            price_related_fields = ["price", "discount_price", "discount_amount", "availability"]
+            has_price_change = any(change["field"] in price_related_fields for change in changed_fields)
+            
+            # Save to price_history ONLY if price-related fields changed
+            if has_price_change:
+                cursor.execute(
+                    """
+                    INSERT INTO price_history (
+                        product_id,
+                        price,
+                        discount_price,
+                        discount_amount,
+                        availability,
+                        recorded_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, NOW())
+                    """,
+                    (
+                        product_id,
+                        new_data.get("price"),
+                        new_data.get("discount_price"),
+                        new_data.get("discount_amount"),
+                        new_data.get("availability")
+                    )
+                )
+                print(f"[DEBUG] Saved to price_history for product {product_id}")
+            
+            # ---------------------------------
+            # FIXED: Save ALL changed fields to product_changes
+            # ---------------------------------
+            import json
+            
+            for change in changed_fields:
+                field = change["field"]
+                old_value = change["old"]
+                new_value = change["new"]
+                
+                # Convert values to JSON strings
+                old_value_json = json.dumps(str(old_value)) if old_value is not None else None
+                new_value_json = json.dumps(str(new_value)) if new_value is not None else None
+                
+                print(f"[DEBUG] Saving to product_changes: {field} - Old: {old_value_json} - New: {new_value_json}")
+                
+                # FIXED: Correct number of parameters (5 values for 5 placeholders)
+                cursor.execute(
+                    """
+                    INSERT INTO product_changes (
+                        product_id,
+                        change_type,
+                        old_value,
+                        new_value,
+                        source,
+                        created_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, NOW())
+                    """,
+                    (
+                        product_id,
+                        field,
+                        old_value_json,
+                        new_value_json,
+                        source
+                    )
+                )
+                print(f"[DEBUG] Successfully saved {field} change to product_changes")
+            
+            self.conn.commit()
+            print(f"[DEBUG] COMMITTED changes for product {product_id}")
+            return True
+            
+        except Exception as e:
+            self.conn.rollback()
+            print(f"[DB UPDATE ERROR] {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+        finally:
+            cursor.close()

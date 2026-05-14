@@ -8,7 +8,7 @@ import time
 from config.brands import SEARCH_BRANDS
 from config.categoriesSpacenet import CATEGORIES
 from core.load_ids import load_existing_product_ids
-from core.http_client import get
+from core.Web.http_client import get
 from core.logger import setup_logger, log_global, write_product_result
 from parsers.spacenet.spacenet_category_parser import parse_spacenet_categories
 from parsers.spacenet.spacenet_product_parser import parse_spacenet_product_page

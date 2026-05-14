@@ -2,7 +2,7 @@ import json
 from bs4 import BeautifulSoup
 from datetime import datetime
 from core.logger import setup_logger
-from core.product_schema import create_product_schema
+from core.Web.product_schema import create_product_schema
 
 logger = setup_logger(site_name="sbs", log_type="scraper")
 

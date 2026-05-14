@@ -4,7 +4,7 @@ from tqdm import tqdm
 from bs4 import BeautifulSoup
 
 from config.categoriesMytek import CATEGORIES
-from core.http_client import get
+from core.Web.http_client import get
 from core.load_ids import load_existing_product_ids
 from core.logger import setup_logger, log_global, write_product_result
 

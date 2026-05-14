@@ -1,8 +1,8 @@
 from bs4 import BeautifulSoup
-from core.clean_text_parser import clean_text
+from core.utils.clean_text_parser import clean_text
 from core.logger import setup_logger
-from core.price_parser import parse_price
-from core.product_schema import create_product_schema
+from core.utils.price_parser import parse_price
+from core.Web.product_schema import create_product_schema
 
 import re
 

@@ -1,7 +1,7 @@
 import json
 import os
 
-from DB.db import Database
+from Database.Postgresql.db import Database
 
 
 

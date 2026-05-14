@@ -1,8 +1,10 @@
+from datetime import datetime
 import json
 import time
 
-from core.cache.redis_client import RedisClient
-from core.cache.cache_keys import product_key
+from Database.Redis.Configuration.redis_client import RedisClient
+from Database.Redis.cache_keys import product_key
+from core.utils.cleaning_url_logic import normalize_url
 
 
 class ProductCache:
@@ -17,7 +19,28 @@ class ProductCache:
         if not value:
             return None
 
-        return value.isoformat()
+        # already string
+        if isinstance(value, str):
+
+            try:
+
+                # normalize ISO dates
+                parsed = datetime.fromisoformat(
+                    value.replace("Z", "")
+                )
+
+                return parsed.date().isoformat()
+
+            except:
+
+                return value
+
+        # datetime object
+        if isinstance(value, datetime):
+
+            return value.date().isoformat()
+
+        return str(value)
     
     # ---------------------------------
     # CACHE EXISTS
@@ -50,7 +73,7 @@ class ProductCache:
         site,
         product_id,
         payload,
-        ttl=3600,
+        ttl=None,
         pipe=None
     ):
 
@@ -58,6 +81,7 @@ class ProductCache:
 
         date = payload.get("price_valid_until")
         cache_payload = {
+            "url" : normalize_url(payload.get("url")),
             "price": payload.get("price"),
             "discount_price": payload.get("discount_price"),
             "discount_amount": payload.get("discount_amount"),

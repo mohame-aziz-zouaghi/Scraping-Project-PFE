@@ -1,6 +1,6 @@
 import json
 import html
-from core.http_client import get
+from core.Web.http_client import get
 from bs4 import BeautifulSoup
 from core.logger import setup_logger
 

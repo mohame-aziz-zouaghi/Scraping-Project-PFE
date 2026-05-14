@@ -1,15 +1,20 @@
 import json
 import locale
+import os
+import subprocess
 import sys
-from core.cache.product_cache import ProductCache
-from monitoring.preload_cache import preload_cache
+from Database.Redis.product_cache import ProductCache
+from menu.redis_manager import RedisManager
+from menu.preload_cache import preload_cache
+from monitoring.run_monitor import run_all_monitors
 from parsers.tunisianet.debug_tunisianet_product import extract_and_clean_tunisianet_product
 from sites.loader import load_sites
 from core.logger import setup_logger
-from DB.load_data_db import run
+from Database.Postgresql.load_data_db import run
 
 sites = load_sites()
 logger = setup_logger()
+
 
 
 # ---------------------------------
@@ -58,7 +63,7 @@ def choose_site():
         site = sites[keys[choice - 1]]
         print_success(f"Selected site: {site.name}")
         return site
-
+    
 
 # ---------------------------------
 # MENU
@@ -81,6 +86,8 @@ def menu():
         print("10 - Load Data Into DB")
         print("11 - Test Redis")
         print("12 - Preoading Data to Redis")
+        print("13 - 🗄️  Redis Management (NEW)") 
+        print("30 - Start Monitoring Products")
         print("0 - Exit")
 
         choice = input("\nChoice: ").strip()
@@ -150,6 +157,15 @@ def menu():
             print_success("Running debug parser...")
             extract_and_clean_tunisianet_product(url)
 
+
+        # ---------------------------------
+        # Start Monitoring
+        # ---------------------------------
+        elif choice == "30":
+            print("\nStarting monitoring system...\n")
+
+            run_all_monitors()    
+
         # ---------------------------------
         # Loading Data into the DB
         # ---------------------------------
@@ -188,6 +204,11 @@ def menu():
             logger.info("CLI | Preloading Data Into Redis Started ")
             preload_cache()
             logger.info("CLI | Preloading Data Into Redis Completed Succesfully ")
+
+
+        elif choice == "13":
+            redis_manager = RedisManager()
+            redis_manager.show_menu()
 
         # ---------------------------------
         # EXIT

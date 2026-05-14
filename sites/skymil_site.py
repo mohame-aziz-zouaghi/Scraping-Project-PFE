@@ -3,7 +3,7 @@ from tqdm import tqdm
 from core.load_ids import load_existing_product_ids
 from core.logger import setup_logger, log_global, write_product_result
 from core.performance import PerformanceTracker
-from core.product_schema import create_product_schema
+from core.Web.product_schema import create_product_schema
 from sites.base_site import BaseSite
 
 logger = setup_logger("skymil", "scraper")
