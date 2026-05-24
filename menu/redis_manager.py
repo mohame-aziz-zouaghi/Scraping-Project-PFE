@@ -293,12 +293,12 @@ class RedisManager:
     # ---------------------------------
     
     def search_products(self):
-        """Search products by site, ID, or URL"""
+        """Search products by site, Main Product ID, or URL"""
         self.print_header("SEARCH PRODUCTS")
         
         print("Search by:")
         print("1 - Site name (e.g., megapc)")
-        print("2 - Product ID")
+        print("2 - Main Product ID")
         print("3 - Partial URL")
         
         search_type = input("\n👉 Choice: ").strip()
@@ -321,7 +321,7 @@ class RedisManager:
             for key in all_keys:
                 data = self.get_product_data(key)
                 if data and isinstance(data, dict):
-                    if data.get('id') == product_id:
+                    if data.get('main_product_id') == product_id:
                         found.append(key)
             
             if found:
@@ -414,7 +414,7 @@ class RedisManager:
         missing_in_redis = []
         
         for product in db_products:
-            redis_key = f"product:{product['site'].lower()}:{product['id']}"
+            redis_key = f"product:{product['site'].lower()}:{product['main_product_id']}"
             if redis_key not in redis_key_set:
                 missing_in_redis.append(redis_key)
         
@@ -428,7 +428,7 @@ class RedisManager:
         # Find products in Redis but not in DB
         db_key_set = set()
         for product in db_products:
-            db_key = f"product:{product['site'].lower()}:{product['id']}"
+            db_key = f"product:{product['site'].lower()}:{product['main_product_id']}"
             db_key_set.add(db_key)
         
         missing_in_db = [key for key in redis_keys if key not in db_key_set]

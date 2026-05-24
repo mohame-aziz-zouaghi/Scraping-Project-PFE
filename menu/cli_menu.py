@@ -4,9 +4,9 @@ import os
 import subprocess
 import sys
 from Database.Redis.product_cache import ProductCache
+from menu.monitoring_menu import monitoring_menu
 from menu.redis_manager import RedisManager
 from menu.preload_cache import preload_cache
-from monitoring.run_monitor import run_all_monitors
 from parsers.tunisianet.debug_tunisianet_product import extract_and_clean_tunisianet_product
 from sites.loader import load_sites
 from core.logger import setup_logger
@@ -164,7 +164,7 @@ def menu():
         elif choice == "30":
             print("\nStarting monitoring system...\n")
 
-            run_all_monitors()    
+            monitoring_menu()   
 
         # ---------------------------------
         # Loading Data into the DB
