@@ -258,10 +258,7 @@ class Database:
         new_data: Dict,
         source: str = None
     ) -> Tuple[bool, Dict]:
-        """
-        Complete product update with all monitoring fields
-        First detect changes, then update if needed
-        """
+        """Complete product update with all monitoring fields"""
         cursor = self.conn.cursor()
         change_summary = {
             "price_changed": False,
@@ -273,9 +270,7 @@ class Database:
         }
         
         try:
-            # =====================================================
-            # STEP 1: GET CURRENT VALUES BEFORE ANY UPDATE
-            # =====================================================
+            # Get current values before any update
             cursor.execute("""
                 SELECT id, price, discount_price, availability, price_change_count,
                     avg_price, min_price, max_price, monitoring_priority
@@ -287,8 +282,19 @@ class Database:
             if not result:
                 return False, change_summary
             
-            product_id, db_price, db_discount, db_availability, current_price_change_count, \
-            current_avg_price, current_min_price, current_max_price, current_priority = result
+
+            print(f"\n New Data : {new_data} \n")
+            
+            # Convert Decimal values to float
+            product_id = result[0]
+            db_price = float(result[1]) if result[1] is not None else 0
+            db_discount = float(result[2]) if result[2] is not None else 0
+            db_availability = result[3]
+            current_price_change_count = int(result[4]) if result[4] is not None else 0
+            current_avg_price = float(result[5]) if result[5] is not None else None
+            current_min_price = float(result[6]) if result[6] is not None else None
+            current_max_price = float(result[7]) if result[7] is not None else None
+            current_priority = result[8]
             
             # Get new values from new_data
             price = new_data.get("price")
@@ -298,9 +304,15 @@ class Database:
             special_id = new_data.get("special_id")
             price_valid_until = new_data.get("price_valid_until")
             
-            # =====================================================
-            # STEP 2: DETECT CHANGES (using current DB values)
-            # =====================================================
+            # Convert to float for comparison
+            if price is not None:
+                price = float(price)
+            if discount_price is not None:
+                discount_price = float(discount_price)
+            if discount_amount is not None:
+                discount_amount = float(discount_amount)
+            
+            # Detect changes
             price_changed = (db_price != price or db_discount != discount_price)
             availability_changed = (db_availability != availability)
             
@@ -318,9 +330,7 @@ class Database:
             
             logger.info(f"Changes detected for {site}/{main_product_id}: price_changed={price_changed}, availability_changed={availability_changed}")
             
-            # =====================================================
-            # STEP 3: UPDATE PRODUCTS TABLE (with all new values)
-            # =====================================================
+            # Update products table
             cursor.execute("""
                 UPDATE products 
                 SET price = %s, discount_price = %s, discount_amount = %s,
@@ -330,9 +340,7 @@ class Database:
             """, (price, discount_price, discount_amount, availability, special_id,
                 price_valid_until, product_id))
             
-            # =====================================================
-            # STEP 4: UPDATE PRICE STATISTICS (only if price changed)
-            # =====================================================
+            # Update price statistics only if price changed
             if price_changed and price is not None:
                 self._update_price_statistics(cursor, product_id, price, current_price_change_count)
             
@@ -342,26 +350,20 @@ class Database:
                     UPDATE products SET min_price = %s, max_price = %s, avg_price = %s WHERE id = %s
                 """, (price, price, price, product_id))
             
-            # =====================================================
-            # STEP 5: UPDATE AVAILABILITY COUNTER
-            # =====================================================
+            # Update availability counter
             if availability_changed:
                 cursor.execute("""
                     UPDATE products SET availability_change_count = COALESCE(availability_change_count, 0) + 1 WHERE id = %s
                 """, (product_id,))
             
-            # =====================================================
-            # STEP 6: INSERT PRICE HISTORY
-            # =====================================================
+            # Insert price history
             if price_changed:
                 cursor.execute("""
                     INSERT INTO price_history (product_id, price, discount_price, discount_amount, availability, recorded_at)
                     VALUES (%s, %s, %s, %s, %s, NOW())
                 """, (product_id, price, discount_price, discount_amount, availability))
             
-            # =====================================================
-            # STEP 7: INSERT PRODUCT CHANGES
-            # =====================================================
+            # Insert product changes
             self._insert_product_changes(cursor, product_id, old_data, new_data, source)
             
             self.conn.commit()
@@ -371,21 +373,33 @@ class Database:
         except Exception as e:
             self.conn.rollback()
             logger.error(f"Update error: {e}")
+            import traceback
+            traceback.print_exc()
             return False, change_summary
         finally:
             cursor.close()
 
     def _update_price_statistics(self, cursor, product_id: str, new_price: float, current_change_count: int):
-        """Update price statistics (min, max, avg)"""
+        """Update price statistics (min, max, avg) - Fixed Decimal conversion"""
+        
+        # Get price history - convert Decimal to float
         cursor.execute("""
             SELECT price FROM price_history WHERE product_id = %s ORDER BY recorded_at DESC LIMIT 100
         """, (product_id,))
         
-        price_history = [row[0] for row in cursor.fetchall() if row[0] is not None]
-        all_prices = price_history + [new_price]
+        # Convert Decimal values to float
+        price_history = []
+        for row in cursor.fetchall():
+            if row[0] is not None:
+                # Convert Decimal to float
+                price_history.append(float(row[0]))
         
-        new_min = min(all_prices)
-        new_max = max(all_prices)
+        # Add current price
+        all_prices = price_history + [float(new_price)]
+        
+        # Calculate statistics (all are now floats)
+        new_min = float(min(all_prices))
+        new_max = float(max(all_prices))
         new_avg = round(sum(all_prices) / len(all_prices), 2)
         
         cursor.execute("""
@@ -945,5 +959,46 @@ class Database:
         except Exception as e:
             logger.error(f"Failed to get disabled products: {e}")
             return []
+        finally:
+            cursor.close()
+
+
+
+    # =====================================================
+    # RESOLVE PRICE INCREASE ALERTS
+    # =====================================================
+
+    def resolve_price_increase_alerts(self, product_id: str, current_price: float) -> int:
+        """
+        Resolve price increase alerts when price drops back to within 10% of original price
+        
+        Args:
+            product_id: The UUID of the product
+            current_price: The current price of the product
+        
+        Returns:
+            Number of alerts resolved
+        """
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute("""
+                UPDATE monitoring_alerts 
+                SET is_resolved = TRUE, resolved_at = NOW()
+                WHERE product_id = %s 
+                AND alert_type = 'price_increase'
+                AND is_resolved = FALSE
+                AND old_value::numeric * 1.1 >= %s
+            """, (product_id, current_price))
+            resolved_count = cursor.rowcount
+            self.conn.commit()
+            
+            if resolved_count > 0:
+                logger.info(f"Resolved {resolved_count} price increase alerts for product {product_id} (price dropped to {current_price})")
+            
+            return resolved_count
+        except Exception as e:
+            self.conn.rollback()
+            logger.error(f"Failed to resolve price increase alerts: {e}")
+            return 0
         finally:
             cursor.close()
