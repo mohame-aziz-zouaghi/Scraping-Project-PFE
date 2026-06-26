@@ -84,7 +84,7 @@ class ResultProcessor:
             
             if is_price_change:
                 new_price = float(new_data.get("price", 0))
-                self.cache.update_price_volatility(site, main_product_id, new_price)
+                self.db.update_price_volatility(site, main_product_id, new_price)
             
             logger.info(f"{site} | REDIS_UPDATED | {main_product_id}")
             
@@ -201,21 +201,35 @@ class ResultProcessor:
     def handle_failed_product(self, site: str, main_product_id: str, product_id: str = None) -> bool:
         """
         Handle a product that failed to fetch (404, timeout, etc.)
-        Increments failure counter and disables if >= 3 failures
+        Uses increment_check_failure to handle the logic
+        Returns True if product is now disabled or already disabled
         """
-        # Increment failure counter in PostgreSQL
-        failure_count = self.db.increment_check_failure(main_product_id, site)
-        
-        # Also update Redis cache with failure info
-        product = self.cache.get_product(site, main_product_id)
-        if product:
-            product["consecutive_errors"] = failure_count
-            self.cache.set_product(site, main_product_id, product)
-        
-        logger.warning(f"{site} | FAILURE_COUNT | {main_product_id} | failures={failure_count}")
-        
-        # If product is now disabled, log it
-        if failure_count >= 3:
-            logger.warning(f"{site} | PRODUCT_DISABLED | {main_product_id} | due to {failure_count} consecutive failures")
-        
-        return failure_count >= 3
+        try:
+            # Use the existing method to handle failure
+            result = self.db.increment_check_failure(main_product_id, site)
+            
+            failure_count = result.get("failure_count", 0)
+            is_disabled = result.get("is_disabled", False)
+            
+            # Update Redis cache with failure info
+            product = self.cache.get_product(site, main_product_id)
+            if product:
+                product["consecutive_errors"] = failure_count
+                product["check_failures"] = failure_count
+                if is_disabled:
+                    product["is_enabled"] = False
+                self.cache.set_product(site, main_product_id, product)
+            
+            # Log appropriately
+            if is_disabled:
+                logger.warning(f"{site} | PRODUCT_DISABLED | {main_product_id} | failures={failure_count}")
+            elif failure_count > 0:
+                logger.warning(f"{site} | FAILURE_COUNT | {main_product_id} | failures={failure_count}/3")
+            else:
+                logger.debug(f"{site} | FAILURE_HANDLED | {main_product_id} | already disabled")
+            
+            return is_disabled
+            
+        except Exception as e:
+            logger.error(f"{site} | HANDLE_FAILURE_ERROR | {main_product_id} | {e}")
+            return False

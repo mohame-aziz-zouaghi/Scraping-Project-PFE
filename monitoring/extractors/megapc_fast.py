@@ -54,6 +54,10 @@ def extract_megapc_fast(html):
             return None
         
         normal_price = clean_price(product.get("price"))
+
+        if normal_price is None :
+            normal_price = 0
+
         promo_price = clean_price(product.get("prixEnPromo"))
         
         final_price = normal_price

@@ -140,45 +140,142 @@ class Database:
     # =====================================================
     
     def upsert_products(self, products: List[Dict]) -> int:
-        """Insert or update products from scraping"""
+        """
+        Insert or update products from scraping with full change detection
+        Handles ALL tables: products, price_history, product_changes, 
+        monitoring_alerts, and monitoring_stats
+        
+        Only updates if:
+        1. Product has all required fields (main_product_id, url, name, price)
+        2. There are actual changes detected
+        3. Data is valid and complete
+        """
         if not products:
             return 0
 
         cursor = self.conn.cursor()
         upserted_count = 0
+        
+        # =====================================================
+        # FILTER: Skip products with missing required fields
+        # =====================================================
+        valid_products = []
+        for p in products:
+            # Required fields check
+            if not p.get("main_product_id"):
+                logger.warning(f"Skipping product: missing main_product_id")
+                continue
+            if not p.get("url"):
+                logger.warning(f"Skipping product {p.get('main_product_id')}: missing url")
+                continue
+            if not p.get("name"):
+                logger.warning(f"Skipping product {p.get('main_product_id')}: missing name")
+                continue
+            if p.get("price") is None:
+                logger.warning(f"Skipping product {p.get('main_product_id')}: missing price")
+                continue
+            
+            # Price must be valid (not 0 for new products, but can be 0 for free items)
+            # We'll allow price=0 but log it
+            valid_products.append(p)
+        
+        if not valid_products:
+            logger.warning("No valid products to upsert after filtering")
+            return 0
+        
+        logger.info(f"Processing {len(valid_products)} valid products out of {len(products)} total")
+
+        # First, collect all URLs and main_product_ids to check existence
+        urls = [p.get('url') for p in valid_products if p.get('url')]
+        main_ids = [p.get('main_product_id') for p in valid_products if p.get('main_product_id')]
+        
+        existing_products = {}
+        
+        if urls:
+            cursor.execute("""
+                SELECT id, site, main_product_id, url, price, discount_price, 
+                    discount_amount, availability, special_id, price_valid_until,
+                    name, brand, category, description, short_description, 
+                    main_image, images, scraped_at, is_enabled, check_failures,
+                    price_change_count, availability_change_count
+                FROM products 
+                WHERE url = ANY(%s)
+            """, (urls,))
+            
+            for row in cursor.fetchall():
+                existing_products[row[2]] = {
+                    "id": row[0],
+                    "site": row[1],
+                    "main_product_id": row[2],
+                    "url": row[3],
+                    "price": float(row[4]) if row[4] is not None else 0,
+                    "discount_price": float(row[5]) if row[5] is not None else 0,
+                    "discount_amount": float(row[6]) if row[6] is not None else 0,
+                    "availability": row[7],
+                    "special_id": row[8],
+                    "price_valid_until": row[9],
+                    "name": row[10],
+                    "brand": row[11],
+                    "category": row[12],
+                    "description": row[13],
+                    "short_description": row[14],
+                    "main_image": row[15],
+                    "images": row[16],
+                    "scraped_at": row[17],
+                    "is_enabled": row[18],
+                    "check_failures": row[19] or 0,
+                    "price_change_count": row[20] or 0,
+                    "availability_change_count": row[21] or 0
+                }
 
         upsert_query = """
         INSERT INTO products (
             site, main_product_id, special_id, name, brand, category,
             price, discount_price, discount_amount, availability, price_valid_until,
             url, description, short_description, main_image, images,
-            scraped_at, last_updated_at
+            scraped_at, last_updated_at, is_enabled
         )
         VALUES (
             %(site)s, %(main_product_id)s, %(special_id)s, %(name)s, %(brand)s, %(category)s,
             %(price)s, %(discount_price)s, %(discount_amount)s, %(availability)s, %(price_valid_until)s,
             %(url)s, %(description)s, %(short_description)s, %(main_image)s, %(images)s, 
-            NOW(), NOW()
+            NOW(), NOW(), TRUE
         )
         ON CONFLICT (url)
         DO UPDATE SET
-            name = EXCLUDED.name, brand = EXCLUDED.brand, category = EXCLUDED.category,
-            price = EXCLUDED.price, discount_price = EXCLUDED.discount_price,
-            discount_amount = EXCLUDED.discount_amount, availability = EXCLUDED.availability,
-            price_valid_until = EXCLUDED.price_valid_until, description = EXCLUDED.description,
-            short_description = EXCLUDED.short_description, main_image = EXCLUDED.main_image,
-            images = EXCLUDED.images, last_updated_at = NOW()
-        RETURNING id
+            name = COALESCE(EXCLUDED.name, products.name),
+            brand = COALESCE(EXCLUDED.brand, products.brand),
+            category = COALESCE(EXCLUDED.category, products.category),
+            price = COALESCE(EXCLUDED.price, products.price),
+            discount_price = COALESCE(EXCLUDED.discount_price, products.discount_price),
+            discount_amount = COALESCE(EXCLUDED.discount_amount, products.discount_amount),
+            availability = COALESCE(EXCLUDED.availability, products.availability),
+            price_valid_until = COALESCE(EXCLUDED.price_valid_until, products.price_valid_until),
+            description = COALESCE(EXCLUDED.description, products.description),
+            short_description = COALESCE(EXCLUDED.short_description, products.short_description),
+            main_image = COALESCE(EXCLUDED.main_image, products.main_image),
+            images = COALESCE(EXCLUDED.images, products.images),
+            special_id = COALESCE(EXCLUDED.special_id, products.special_id),
+            last_updated_at = NOW()
+        RETURNING id, site, main_product_id, price, discount_price, 
+                discount_amount, availability, special_id, price_valid_until,
+                name, brand, category, is_enabled,
+                price_change_count, availability_change_count
         """
 
         try:
-            for product in products:
-                # Normalizations
+            for product in valid_products:
+                # =====================================================
+                # NORMALIZE DATA
+                # =====================================================
+                
+                # Normalize short_description (ensure it's JSONB)
                 if isinstance(product.get("short_description"), (dict, list)):
                     product["short_description"] = Json(product["short_description"])
                 elif product.get("short_description") is None:
                     product["short_description"] = Json([])
                 
+                # Normalize images (ensure it's JSONB)
                 images = product.get("images")
                 if isinstance(images, set):
                     images = list(images)
@@ -187,10 +284,12 @@ class Database:
                 elif images is None:
                     product["images"] = Json([])
                 
+                # Normalize price_valid_until
                 val = product.get("price_valid_until")
                 if val in ("", " ", None):
                     product["price_valid_until"] = None
                 
+                # Ensure numeric values are floats
                 if product.get("price") is not None:
                     product["price"] = float(product["price"])
                 if product.get("discount_price") is not None:
@@ -198,16 +297,227 @@ class Database:
                 if product.get("discount_amount") is not None:
                     product["discount_amount"] = float(product["discount_amount"])
                 
+                # =====================================================
+                # GET EXISTING PRODUCT DATA FOR CHANGE DETECTION
+                # =====================================================
+                main_product_id = product.get("main_product_id")
+                existing = existing_products.get(main_product_id)
+                
+                # Execute upsert
                 cursor.execute(upsert_query, product)
-                cursor.fetchone()
+                result = cursor.fetchone()
+                
+                if not result:
+                    continue
+                
+                # Extract results
+                product_id, site, main_product_id, db_price, db_discount, \
+                db_discount_amount, db_availability, db_special_id, db_price_valid_until, \
+                db_name, db_brand, db_category, db_is_enabled, \
+                db_price_change_count, db_availability_change_count = result
+                
+                # =====================================================
+                # CHANGE DETECTION - Only if product exists
+                # =====================================================
+                new_price = product.get("price", 0)
+                new_discount_price = product.get("discount_price", 0)
+                new_discount_amount = product.get("discount_amount", 0)
+                new_availability = product.get("availability")
+                new_special_id = product.get("special_id")
+                new_price_valid_until = product.get("price_valid_until")
+                new_name = product.get("name")
+                new_brand = product.get("brand")
+                new_category = product.get("category")
+                new_description = product.get("description", "")
+                new_short_description = product.get("short_description", [])
+                new_main_image = product.get("main_image")
+                new_images = product.get("images", [])
+                
+                # Check each field for changes
+                price_changed = (
+                    db_price != new_price or 
+                    db_discount != new_discount_price or 
+                    db_discount_amount != new_discount_amount
+                )
+                availability_changed = (db_availability != new_availability)
+                special_id_changed = (db_special_id != new_special_id)
+                price_valid_until_changed = (db_price_valid_until != new_price_valid_until)
+                name_changed = (db_name != new_name)
+                brand_changed = (db_brand != new_brand)
+                category_changed = (db_category != new_category)
+                
+                # Check if this is a new product or has changes
+                is_new_product = not existing
+                has_any_change = (
+                    price_changed or availability_changed or special_id_changed or 
+                    price_valid_until_changed or name_changed or brand_changed or 
+                    category_changed
+                )
+                
+                # =====================================================
+                # UPDATE TRACKING TABLES ONLY IF CHANGES EXIST
+                # =====================================================
+                if existing and has_any_change:
+                    changed_fields = []
+                    
+                    # --- Price changes ---
+                    if price_changed:
+                        cursor.execute("""
+                            UPDATE products 
+                            SET price_change_count = COALESCE(price_change_count, 0) + 1,
+                                last_price_change = NOW()
+                            WHERE id = %s
+                        """, (product_id,))
+                        
+                        # Insert price history
+                        cursor.execute("""
+                            INSERT INTO price_history (
+                                product_id, price, discount_price, 
+                                discount_amount, availability, recorded_at
+                            )
+                            VALUES (%s, %s, %s, %s, %s, NOW())
+                        """, (product_id, new_price, new_discount_price, 
+                            new_discount_amount, new_availability))
+                        
+                        changed_fields.append(("price", db_price, new_price))
+                        changed_fields.append(("discount_price", db_discount, new_discount_price))
+                        changed_fields.append(("discount_amount", db_discount_amount, new_discount_amount))
+                        
+                        # Update price statistics
+                        self._update_price_statistics(cursor, product_id, new_price, db_price_change_count)
+                    
+                    # --- Availability changes ---
+                    if availability_changed:
+                        cursor.execute("""
+                            UPDATE products 
+                            SET availability_change_count = COALESCE(availability_change_count, 0) + 1
+                            WHERE id = %s
+                        """, (product_id,))
+                        changed_fields.append(("availability", db_availability, new_availability))
+                    
+                    # --- Other field changes ---
+                    if special_id_changed:
+                        changed_fields.append(("special_id", db_special_id, new_special_id))
+                    if price_valid_until_changed:
+                        changed_fields.append(("price_valid_until", db_price_valid_until, new_price_valid_until))
+                    if name_changed:
+                        changed_fields.append(("name", db_name, new_name))
+                    if brand_changed:
+                        changed_fields.append(("brand", db_brand, new_brand))
+                    if category_changed:
+                        changed_fields.append(("category", db_category, new_category))
+                    
+                    # --- Insert into product_changes for all changed fields ---
+                    for field, old_val, new_val in changed_fields:
+                        old_json = json.dumps(str(old_val)) if old_val is not None else None
+                        new_json = json.dumps(str(new_val)) if new_val is not None else None
+                        
+                        cursor.execute("""
+                            INSERT INTO product_changes (
+                                product_id, change_type, old_value, new_value, source, created_at
+                            )
+                            VALUES (%s, %s, %s::jsonb, %s::jsonb, %s, NOW())
+                        """, (product_id, field, old_json, new_json, "scraping"))
+                    
+                    # --- Create alerts for significant changes ---
+                    
+                    # Price drop > 10%
+                    if price_changed and db_price > 0 and new_price < db_price * 0.9:
+                        cursor.execute("""
+                            INSERT INTO monitoring_alerts (
+                                product_id, site, alert_type, old_value, new_value, severity, created_at
+                            )
+                            VALUES (%s, %s, 'price_drop', %s, %s, 'high', NOW())
+                        """, (product_id, site, str(db_price), str(new_price)))
+                        logger.warning(f"SCRAPING | ALERT | Price dropped >10%: {db_price} -> {new_price}")
+                    
+                    # Price increase > 20%
+                    if price_changed and db_price > 0 and new_price > db_price * 1.2:
+                        cursor.execute("""
+                            INSERT INTO monitoring_alerts (
+                                product_id, site, alert_type, old_value, new_value, severity, created_at
+                            )
+                            VALUES (%s, %s, 'price_increase', %s, %s, 'medium', NOW())
+                        """, (product_id, site, str(db_price), str(new_price)))
+                        logger.warning(f"SCRAPING | ALERT | Price increased >20%: {db_price} -> {new_price}")
+                    
+                    # Back in stock alert
+                    if availability_changed and db_availability == "OutOfStock" and new_availability == "InStock":
+                        cursor.execute("""
+                            INSERT INTO monitoring_alerts (
+                                product_id, site, alert_type, old_value, new_value, severity, created_at
+                            )
+                            VALUES (%s, %s, 'back_in_stock', %s, %s, 'high', NOW())
+                        """, (product_id, site, db_availability, new_availability))
+                        logger.warning(f"SCRAPING | ALERT | Product back in stock: {main_product_id}")
+                    
+                    # Out of stock alert
+                    if availability_changed and db_availability == "InStock" and new_availability == "OutOfStock":
+                        cursor.execute("""
+                            INSERT INTO monitoring_alerts (
+                                product_id, site, alert_type, old_value, new_value, severity, created_at
+                            )
+                            VALUES (%s, %s, 'out_of_stock', %s, %s, 'medium', NOW())
+                        """, (product_id, site, db_availability, new_availability))
+                        logger.warning(f"SCRAPING | ALERT | Product went out of stock: {main_product_id}")
+                    
+                    # --- Update monitoring_stats ---
+                    cursor.execute("""
+                        INSERT INTO monitoring_stats (site, product_id, change_count, updated_at)
+                        VALUES (%s, %s, 1, NOW())
+                        ON CONFLICT (site, product_id) 
+                        DO UPDATE SET
+                            change_count = monitoring_stats.change_count + 1,
+                            updated_at = NOW()
+                    """, (site.lower(), product_id))
+                    
+                    logger.info(f"Updated product: {main_product_id} | Changes: {len(changed_fields)}")
+                    
+                    # --- Resolve existing alerts if conditions improved ---
+                    if price_changed and new_price > 0:
+                        self.resolve_price_drop_alerts(product_id, new_price)
+                        self.resolve_price_increase_alerts(product_id, new_price)
+                    
+                    if availability_changed and new_availability == "OutOfStock":
+                        self.resolve_back_in_stock_alerts(product_id, new_availability)
+                
+                # =====================================================
+                # IF PRODUCT IS NEW, CREATE INITIAL MONITORING_STATS
+                # =====================================================
+                elif is_new_product:
+                    cursor.execute("""
+                        INSERT INTO monitoring_stats (site, product_id, check_count, change_count, last_success, created_at, updated_at)
+                        VALUES (%s, %s, 1, 0, NOW(), NOW(), NOW())
+                        ON CONFLICT (site, product_id) DO NOTHING
+                    """, (site.lower(), product_id))
+                    
+                    logger.info(f"New product inserted: {main_product_id}")
+                
                 upserted_count += 1
+                
+                # Cache the product for future iterations in this batch
+                if main_product_id not in existing_products:
+                    existing_products[main_product_id] = {
+                        "id": product_id,
+                        "site": site,
+                        "main_product_id": main_product_id,
+                        "price": new_price,
+                        "discount_price": new_discount_price,
+                        "discount_amount": new_discount_amount,
+                        "availability": new_availability,
+                        "special_id": new_special_id,
+                        "price_valid_until": new_price_valid_until
+                    }
 
             self.conn.commit()
-            logger.info(f"Upsert complete: {upserted_count} products")
+            logger.info(f"Upsert complete: {upserted_count} products processed")
             return upserted_count
+            
         except Exception as e:
             self.conn.rollback()
             logger.error(f"Upsert error: {e}")
+            import traceback
+            traceback.print_exc()
             return 0
         finally:
             cursor.close()
@@ -284,6 +594,7 @@ class Database:
             
 
             print(f"\n New Data : {new_data} \n")
+            print(f"\n result : {result} \n")
             
             # Convert Decimal values to float
             product_id = result[0]
@@ -549,50 +860,6 @@ class Database:
     def is_site_enabled(self, site: str) -> bool:
         config = self.get_site_config(site)
         return config.get("enabled", True)
-
-
-    # =====================================================
-    # PRICE VOLATILITY
-    # =====================================================
-    
-    def update_price_volatility(self, site: str, main_product_id: str, new_price: float) -> bool:
-        cursor = self.conn.cursor()
-        try:
-            cursor.execute("SELECT price, price_volatility_score FROM products WHERE site = %s AND main_product_id = %s", (site.lower(), main_product_id))
-            row = cursor.fetchone()
-            if not row:
-                return False
-            
-            old_price, current_volatility = row[0] or 0, row[1] or 50
-            
-            if old_price > 0:
-                change_percent = abs(new_price - old_price) / old_price * 100
-                if change_percent > 20:
-                    new_volatility = min(100, current_volatility + 10)
-                elif change_percent > 10:
-                    new_volatility = min(100, current_volatility + 5)
-                elif change_percent > 5:
-                    new_volatility = current_volatility
-                else:
-                    new_volatility = max(0, current_volatility - 2)
-            else:
-                new_volatility = current_volatility
-            
-            trend = "upward" if new_price > old_price else "downward" if new_price < old_price else "stable"
-            
-            cursor.execute("""
-                UPDATE products SET price_volatility_score = %s, price_trend = %s, last_updated_at = NOW()
-                WHERE site = %s AND main_product_id = %s
-            """, (new_volatility, trend, site.lower(), main_product_id))
-            self.conn.commit()
-            return True
-        except Exception as e:
-            self.conn.rollback()
-            logger.error(f"Failed to update volatility: {e}")
-            return False
-        finally:
-            cursor.close()
-
 
 
     def resolve_alert(self, alert_id: int) -> bool:
@@ -879,40 +1146,77 @@ class Database:
         finally:
             cursor.close()
 
-    def increment_check_failure(self, main_product_id: str, site: str) -> int:
+    def increment_check_failure(self, main_product_id: str, site: str) -> Dict:
         """
         Increment check_failures counter for a product
-        Returns the new failure count
+        Returns: {'failure_count': int, 'is_disabled': bool}
         """
         cursor = self.conn.cursor()
         try:
+            # First, check current state
+            cursor.execute("""
+                SELECT check_failures, is_enabled, id
+                FROM products 
+                WHERE site = %s AND main_product_id = %s
+            """, (site.lower(), main_product_id))
+            
+            result = cursor.fetchone()
+            if not result:
+                logger.warning(f"Product not found: {site}/{main_product_id}")
+                return {"failure_count": 0, "is_disabled": False}
+            
+            current_failures = result[0] or 0
+            is_enabled = result[1]
+            product_uuid = result[0]
+            
+            # =====================================================
+            # CASE 1: Already disabled - no increment
+            # =====================================================
+            if not is_enabled or current_failures >= 3:
+                logger.debug(f"Product already disabled: {site}/{main_product_id} (failures={current_failures})")
+                return {"failure_count": current_failures, "is_disabled": True}
+            
+            # =====================================================
+            # CASE 2: Increment failures
+            # =====================================================
+            new_failure_count = current_failures + 1
+            
             cursor.execute("""
                 UPDATE products 
-                SET check_failures = COALESCE(check_failures, 0) + 1,
+                SET check_failures = %s,
                     last_updated_at = NOW()
                 WHERE site = %s AND main_product_id = %s
                 RETURNING check_failures
-            """, (site.lower(), main_product_id))
-            result = cursor.fetchone()
-            new_failure_count = result[0] if result else 0
-            self.conn.commit()
+            """, (new_failure_count, site.lower(), main_product_id))
             
-            # If failure count >= 3, disable the product
-            if new_failure_count >= 3:
+            result = cursor.fetchone()
+            new_count = result[0] if result else new_failure_count
+            
+            is_disabled = False
+            
+            # =====================================================
+            # CASE 3: Check if should disable (reached 3)
+            # =====================================================
+            if new_count >= 3:
+                # Get product UUID for disable
                 cursor.execute("""
                     SELECT id FROM products 
                     WHERE site = %s AND main_product_id = %s
                 """, (site.lower(), main_product_id))
-                product = cursor.fetchone()
-                if product:
-                    self.disable_product(product[0], "consecutive_failures")
-                    logger.warning(f"Product disabled due to {new_failure_count} consecutive failures: {site}/{main_product_id}")
+                product_row = cursor.fetchone()
+                
+                if product_row:
+                    self.disable_product(product_row[0], "consecutive_failures")
+                    is_disabled = True
+                    logger.warning(f"Product disabled due to {new_count} consecutive failures: {site}/{main_product_id}")
             
-            return new_failure_count
+            self.conn.commit()
+            return {"failure_count": new_count, "is_disabled": is_disabled}
+            
         except Exception as e:
             self.conn.rollback()
             logger.error(f"Failed to increment check failure: {e}")
-            return 0
+            return {"failure_count": 0, "is_disabled": False}
         finally:
             cursor.close()
 
@@ -1000,5 +1304,72 @@ class Database:
             self.conn.rollback()
             logger.error(f"Failed to resolve price increase alerts: {e}")
             return 0
+        finally:
+            cursor.close()
+
+
+    def update_price_volatility(self, site: str, main_product_id: str, new_price: float) -> bool:
+        """Update price volatility score in PostgreSQL based on price change"""
+        cursor = self.conn.cursor()
+        try:
+            # Get current product data - convert Decimal to float
+            cursor.execute("""
+                SELECT price, price_volatility_score, price_change_count
+                FROM products 
+                WHERE site = %s AND main_product_id = %s
+            """, (site.lower(), main_product_id))
+            
+            row = cursor.fetchone()
+            if not row:
+                logger.warning(f"Product not found for volatility update: {site}/{main_product_id}")
+                return False
+            
+            # Convert Decimal to float
+            old_price = float(row[0]) if row[0] is not None else 0
+            current_volatility = int(row[1]) if row[1] is not None else 50
+            
+            # Calculate new volatility
+            if old_price > 0:
+                price_change_percent = abs(new_price - old_price) / old_price * 100
+                
+                if price_change_percent > 20:
+                    new_volatility = min(100, current_volatility + 10)
+                elif price_change_percent > 10:
+                    new_volatility = min(100, current_volatility + 5)
+                elif price_change_percent > 5:
+                    new_volatility = current_volatility
+                else:
+                    new_volatility = max(0, current_volatility - 2)
+            else:
+                new_volatility = current_volatility
+            
+            # Determine price trend
+            if old_price > 0:
+                if new_price > old_price:
+                    trend = "upward"
+                elif new_price < old_price:
+                    trend = "downward"
+                else:
+                    trend = "stable"
+            else:
+                trend = "stable"
+            
+            # Update the product
+            cursor.execute("""
+                UPDATE products 
+                SET price_volatility_score = %s,
+                    price_trend = %s,
+                    last_updated_at = NOW()
+                WHERE site = %s AND main_product_id = %s
+            """, (new_volatility, trend, site.lower(), main_product_id))
+            
+            self.conn.commit()
+            logger.debug(f"Updated price volatility for {site}/{main_product_id}: {new_volatility} ({trend})")
+            return True
+            
+        except Exception as e:
+            self.conn.rollback()
+            logger.error(f"Failed to update price volatility: {e}")
+            return False
         finally:
             cursor.close()

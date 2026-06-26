@@ -47,8 +47,8 @@ def parse_megapc_product_details(data: Dict[str, Any]) -> Dict[str, Any]:
     
     return {
         "description": product.get("description_fr") or product.get("description", ""),
-        "short_description": product.get("miniDescription_fr") or product.get("miniDescription", "") or product.get("short_description", ""),
-        "sku": product.get("sku") or product.get("reference"),
+        "short_description": product.get("miniDescription_fr"),
+        "sku": product.get("sku") or product.get("referenceInterne") or product.get("mpn"),
         "images": image_urls,
         "price_valid_until": price_valid_until,
         "meta_title": product.get("meta_title"),

@@ -192,72 +192,7 @@ class ProductCache:
         """Update when this product should be checked next"""
         return self.update_monitoring_fields(site, main_product_id, {"next_check_at": next_check_at})
 
-    def update_price_volatility(self, site: str, main_product_id: str, new_price: float) -> bool:
-        """Update price volatility score in PostgreSQL based on price change"""
-        cursor = self.conn.cursor()
-        try:
-            # Get current product data - convert Decimal to float
-            cursor.execute("""
-                SELECT price, price_volatility_score, price_change_count
-                FROM products 
-                WHERE site = %s AND main_product_id = %s
-            """, (site.lower(), main_product_id))
-            
-            row = cursor.fetchone()
-            if not row:
-                logger.warning(f"Product not found for volatility update: {site}/{main_product_id}")
-                return False
-            
-            # Convert Decimal to float
-            old_price = float(row[0]) if row[0] is not None else 0
-            current_volatility = int(row[1]) if row[1] is not None else 50
-            
-            # Calculate new volatility
-            if old_price > 0:
-                price_change_percent = abs(new_price - old_price) / old_price * 100
-                
-                if price_change_percent > 20:
-                    new_volatility = min(100, current_volatility + 10)
-                elif price_change_percent > 10:
-                    new_volatility = min(100, current_volatility + 5)
-                elif price_change_percent > 5:
-                    new_volatility = current_volatility
-                else:
-                    new_volatility = max(0, current_volatility - 2)
-            else:
-                new_volatility = current_volatility
-            
-            # Determine price trend
-            if old_price > 0:
-                if new_price > old_price:
-                    trend = "upward"
-                elif new_price < old_price:
-                    trend = "downward"
-                else:
-                    trend = "stable"
-            else:
-                trend = "stable"
-            
-            # Update the product
-            cursor.execute("""
-                UPDATE products 
-                SET price_volatility_score = %s,
-                    price_trend = %s,
-                    last_updated_at = NOW()
-                WHERE site = %s AND main_product_id = %s
-            """, (new_volatility, trend, site.lower(), main_product_id))
-            
-            self.conn.commit()
-            logger.debug(f"Updated price volatility for {site}/{main_product_id}: {new_volatility} ({trend})")
-            return True
-            
-        except Exception as e:
-            self.conn.rollback()
-            logger.error(f"Failed to update price volatility: {e}")
-            return False
-        finally:
-            cursor.close()
-
+    
     # =====================================================
     # CHANGE DETECTION
     # =====================================================
