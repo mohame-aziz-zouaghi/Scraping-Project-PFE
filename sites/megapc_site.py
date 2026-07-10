@@ -516,7 +516,6 @@ class MegaPCSite(BaseSite):
         try:
             slug = product_data.get("slug")
             product_id = product_data.get("id")
-            print
             
             if not slug or not product_id:
                 logger.warning(f"{self.name} | SKIP_NO_ID | slug={slug}")
