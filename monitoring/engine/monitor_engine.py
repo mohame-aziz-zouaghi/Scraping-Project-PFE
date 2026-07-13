@@ -9,6 +9,7 @@ from Database.Redis.Configuration.redis_client import RedisClient
 from Database.Redis.cache_keys import site_pattern, extract_product_id_from_key
 from core.logger import setup_logger
 from core.utils.progress_bar import ProgressBar
+from core.utils.debug_logger import log_debug, log_scrape_stats, end_session
 from monitoring.engine.worker_pool import WorkerPool
 from monitoring.engine.result_processor import ResultProcessor
 from monitoring.engine.site_registry import SITE_WORKERS, get_site_config, update_site_config
@@ -22,6 +23,7 @@ class MonitorEngine:
         self.redis = RedisClient().get_client()
         self.processor = ResultProcessor()
         self.worker_pool = None
+        self.changed_products = []  # Track changed products for recap
 
     # ---------------------------------
     # LOAD PRODUCTS FROM REDIS
@@ -75,11 +77,6 @@ class MonitorEngine:
                     # If more than 3 days, we can consider re-enabling later, but skip for now
                     continue
                 
-                # # Only load enabled products that are due for checking
-                # next_check = data.get("next_check_at")
-                # if next_check and now < next_check:
-                #     continue
-                
                 product = {
                     "main_product_id": main_product_id,
                     "site": site,
@@ -106,14 +103,15 @@ class MonitorEngine:
     # ---------------------------------
     # MONITOR CYCLE (USING WORKER POOL)
     # ---------------------------------
-    # monitoring/engine/monitor_engine.py - monitor_cycle method only
-
     def monitor_cycle(self, site: str, workers: int = 20, show_progress: bool = True, stop_event: threading.Event = None) -> dict:
         """
         Run one monitoring cycle with progress bar
         """
         start = time.time()
         site = site.lower()
+        
+        # Reset changed products list for this cycle
+        self.changed_products = []
         
         # Get site configuration
         config = get_site_config(site)
@@ -168,6 +166,13 @@ class MonitorEngine:
                     result = future.result(timeout=60)
                     if result:
                         changed_count += 1
+                        # Track changed product for recap
+                        product = futures[future]
+                        self.changed_products.append({
+                            "product_id": product.get("main_product_id"),
+                            "url": product.get("url"),
+                            "price": product.get("price")
+                        })
                     else:
                         no_change_count += 1
                 except Exception as e:
@@ -195,12 +200,57 @@ class MonitorEngine:
             print(f"      ○ No change: {no_change_count}")
             print(f"      ✗ Errors: {error_count}")
             print(f"      ⏱️ Time: {elapsed}s")
+            
+            # Show changed products sample (first 5)
+            if self.changed_products:
+                print(f"\n   📝 Changed Products (sample):")
+                for i, prod in enumerate(self.changed_products[:5], 1):
+                    print(f"      {i}. {prod['product_id']} - Price: {prod['price']} TND")
+                if len(self.changed_products) > 5:
+                    print(f"      ... and {len(self.changed_products) - 5} more")
         
         logger.info(
             f"{site} | CYCLE_FINISHED | "
             f"total={total} | changed={changed_count} | "
             f"no_change={no_change_count} | errors={error_count} | time={elapsed}s"
         )
+        
+        # =====================================================
+        # LOG CYCLE RECAP TO RECAP FILE (not debug)
+        # =====================================================
+        cycle_stats = {
+            "cycle_type": "monitoring",
+            "site": site,
+            "cycle_time_seconds": elapsed,
+            "total_products": total,
+            "changed_count": changed_count,
+            "no_change_count": no_change_count,
+            "error_count": error_count,
+            "total_changed_products": len(self.changed_products),
+            "changed_products_sample": self.changed_products[:10],
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        # Log to recap file using log_scrape_stats (which writes to recap)
+        log_scrape_stats(
+            site=site,
+            stats=cycle_stats
+        )
+        
+        # Also log changed products specifically to recap
+        if self.changed_products:
+            # Create a detailed recap entry for changed products
+            changed_summary = {
+                "cycle_type": "changed_products_detail",
+                "site": site,
+                "total_changed": len(self.changed_products),
+                "changed_products": self.changed_products[:20],  # First 20
+                "timestamp": datetime.now().isoformat()
+            }
+            log_scrape_stats(
+                site=site,
+                stats=changed_summary
+            )
         
         return {
             "site": site,
@@ -210,7 +260,8 @@ class MonitorEngine:
             "errors": error_count,
             "time": elapsed,
             "stopped": stopped,
-            "timestamp": datetime.now().isoformat()
+            "timestamp": datetime.now().isoformat(),
+            "changed_products": self.changed_products[:10]
         }
 
     # ---------------------------------
@@ -258,9 +309,9 @@ class MonitorEngine:
             logger.info(f"{site} | SLEEPING | {interval}s")
             time.sleep(interval)
 
-
-    # monitoring/engine/monitor_engine.py - Update monitor_site_continuous
-
+    # ---------------------------------
+    # MONITOR SITE CONTINUOUS
+    # ---------------------------------
     def monitor_site_continuous(self, site: str, stop_event: threading.Event = None):
         """
         Continuously monitor a single site with stop event
@@ -291,7 +342,7 @@ class MonitorEngine:
                     site=site, 
                     workers=workers, 
                     show_progress=True,
-                    stop_event=stop_event  # Pass the stop_event
+                    stop_event=stop_event
                 )
                 
                 # If cycle was stopped, break out
@@ -300,6 +351,15 @@ class MonitorEngine:
                     break
                 
                 print(f"\n   📊 Cycle #{cycle_count}: {stats['changed']} changed, {stats['no_change']} unchanged, {stats['errors']} errors")
+                
+                # Show changed products sample
+                changed_products = stats.get('changed_products', [])
+                if changed_products:
+                    print(f"\n   📝 Changed products (sample):")
+                    for i, prod in enumerate(changed_products[:5], 1):
+                        print(f"      {i}. {prod['product_id']} - Price: {prod['price']} TND")
+                    if len(changed_products) > 5:
+                        print(f"      ... and {len(changed_products) - 5} more")
                 
             except Exception as e:
                 logger.error(f"{site} | LOOP_ERROR | {e}")

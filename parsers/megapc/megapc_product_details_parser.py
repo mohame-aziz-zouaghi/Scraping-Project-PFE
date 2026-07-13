@@ -1,6 +1,8 @@
 # parsers/megapc/megapc_product_details_parser.py
 from typing import Dict, Any, Optional, List
 
+from core.utils.clean_date_logic import clean_date
+
 def parse_megapc_product_details(data: Dict[str, Any]) -> Dict[str, Any]:
     """
     Parse MegaPC product details from Next.js data
@@ -35,15 +37,7 @@ def parse_megapc_product_details(data: Dict[str, Any]) -> Dict[str, Any]:
     # Extract price valid until
     price_valid_until = product.get("priceValidUntil") or product.get("price_valid_until")
     
-    # Clean and normalize date
-    if price_valid_until:
-        # Remove any whitespace
-        price_valid_until = str(price_valid_until).strip()
-        # Replace slashes with hyphens for consistency
-        price_valid_until = price_valid_until.replace("/", "-")
-        # Remove time part if exists
-        if "T" in price_valid_until:
-            price_valid_until = price_valid_until.split("T")[0]
+    price_valid_until = clean_date(price_valid_until) if price_valid_until else price_valid_until
     
     return {
         "description": product.get("description_fr") or product.get("description", ""),

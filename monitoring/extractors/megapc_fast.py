@@ -80,7 +80,7 @@ def extract_megapc_fast(html):
             "discount_amount": discount_amount,
             "availability": availability,
             "special_id": (
-                product.get("sku") or product.get("mpn")
+                product.get("mpn") or product.get("sku")
             ),
             "price_valid_until": cleaned_date  # Now always YYYY-MM-DD format
         }
