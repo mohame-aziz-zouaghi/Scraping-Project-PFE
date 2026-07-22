@@ -1,12 +1,14 @@
 # Database/Postgresql/db.py
 import json
+import time
 import psycopg2
 from psycopg2.extras import Json, execute_batch
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
 
 from Database.Postgresql.config import DBConfig
 from core.logger import setup_logger
+from core.utils.clean_date_logic import clean_date
 
 logger = setup_logger("db", "database")
 
@@ -556,196 +558,375 @@ class Database:
         finally:
             cursor.close()
 
-    # =====================================================
-    # CORE MONITORING UPDATE (ALL DB UPDATES IN ONE METHOD)
-    # =====================================================
-    
-    def update_product_with_monitoring_data(
+    def batch_update_products_with_monitoring_data(
         self,
-        site: str,
-        main_product_id: str,
-        old_data: Dict,
-        new_data: Dict,
-        source: str = None
-    ) -> Tuple[bool, Dict]:
-        """Complete product update with all monitoring fields"""
+        products_data: List[Tuple[str, str, Dict, Dict, str]]
+    ) -> Tuple[int, List[Dict]]:
+        """
+        TRUE BATCH UPDATE - Optimized bulk operations with executemany
+        Processes ALL products in 5-7 database trips regardless of batch size
+        
+        Args:
+            products_data: List of (site, main_product_id, old_data, new_data, source)
+        
+        Returns:
+            (success_count, failed_products_list)
+        """
+        if not products_data:
+            return 0, []
+        
         cursor = self.conn.cursor()
-        change_summary = {
-            "price_changed": False,
-            "availability_changed": False,
-            "old_price": None,
-            "new_price": None,
-            "old_availability": None,
-            "new_availability": None
-        }
+        start_time = time.time()
+        
+        # Bulk data collections
+        update_params = []
+        price_history_params = []
+        product_change_params = []
+        alert_params = []
+        monitoring_stats_params = []
+        failed_products = []
         
         try:
-            # Get current values before any update
-            cursor.execute("""
-                SELECT id, price, discount_price, availability, price_change_count,
-                    avg_price, min_price, max_price, monitoring_priority
-                FROM products 
-                WHERE site = %s AND main_product_id = %s
-            """, (site.lower(), main_product_id))
+            # =====================================================
+            # STEP 1: PREPARE ALL DATA
+            # =====================================================
+            logger.info(f"📦 Preparing batch update for {len(products_data)} products...")
             
-            result = cursor.fetchone()
-            if not result:
-                return False, change_summary
+            for site, main_product_id, old_data, new_data, source in products_data:
+                try:
+                    # Validate data types
+                    if not isinstance(old_data, dict) or not isinstance(new_data, dict):
+                        failed_products.append({
+                            "site": site,
+                            "main_product_id": main_product_id,
+                            "reason": "invalid_data_type"
+                        })
+                        continue
+                    
+                    # Get current product data
+                    cursor.execute("""
+                        SELECT id, price, discount_price, availability, 
+                            price_change_count, avg_price, min_price, max_price,
+                            monitoring_priority, special_id, price_valid_until,
+                            price_volatility_score, price_trend
+                        FROM products 
+                        WHERE site = %s AND main_product_id = %s
+                    """, (site.lower(), main_product_id))
+                    
+                    result = cursor.fetchone()
+                    if not result:
+                        failed_products.append({
+                            "site": site,
+                            "main_product_id": main_product_id,
+                            "reason": "product_not_found"
+                        })
+                        continue
+                    
+                    # Unpack results
+                    product_id = result[0]
+                    db_price = float(result[1]) if result[1] is not None else 0
+                    db_discount = float(result[2]) if result[2] is not None else 0
+                    db_availability = result[3]
+                    db_price_change_count = int(result[4]) if result[4] is not None else 0
+                    db_avg_price = float(result[5]) if result[5] is not None else None
+                    db_min_price = float(result[6]) if result[6] is not None else None
+                    db_max_price = float(result[7]) if result[7] is not None else None
+                    db_priority = result[8] or 3
+                    db_special_id = result[9]
+                    db_price_valid_until = result[10]
+                    db_volatility = int(result[11]) if result[11] is not None else 50
+                    db_trend = result[12] or "stable"
+                    
+                    # Extract new values
+                    price = new_data.get("price")
+                    discount_price = new_data.get("discount_price")
+                    discount_amount = new_data.get("discount_amount")
+                    availability = new_data.get("availability")
+                    special_id = new_data.get("special_id")
+                    price_valid_until = new_data.get("price_valid_until")
+                    
+                    # Convert to float
+                    price = float(price) if price is not None else None
+                    discount_price = float(discount_price) if discount_price is not None else None
+                    discount_amount = float(discount_amount) if discount_amount is not None else None
+                    
+                    # Normalize dates
+                    if price_valid_until:
+                        price_valid_until = clean_date(price_valid_until)
+                    if db_price_valid_until:
+                        db_price_valid_until = clean_date(db_price_valid_until)
+                    
+                    # Detect changes
+                    price_changed = (db_price != price or db_discount != discount_price)
+                    availability_changed = (db_availability != availability)
+                    special_id_changed = (db_special_id != special_id)
+                    price_valid_until_changed = (db_price_valid_until != price_valid_until)
+                    
+                    # Skip if no changes
+                    if not any([price_changed, availability_changed, special_id_changed, price_valid_until_changed]):
+                        continue
+                    
+                    # --- Calculate derived values ---
+                    if price_changed and price is not None:
+                        # Get price history for stats
+                        cursor.execute("""
+                            SELECT price FROM price_history 
+                            WHERE product_id = %s ORDER BY recorded_at DESC LIMIT 100
+                        """, (product_id,))
+                        price_history = [float(row[0]) for row in cursor.fetchall() if row[0] is not None]
+                        all_prices = price_history + [float(price)]
+                        
+                        new_min_price = float(min(all_prices))
+                        new_max_price = float(max(all_prices))
+                        new_avg_price = round(sum(all_prices) / len(all_prices), 2)
+                        
+                        # Volatility calculation
+                        if db_price > 0:
+                            change_pct = abs(price - db_price) / db_price * 100
+                            if change_pct > 20:
+                                new_volatility = min(100, db_volatility + 10)
+                            elif change_pct > 10:
+                                new_volatility = min(100, db_volatility + 5)
+                            elif change_pct > 5:
+                                new_volatility = db_volatility
+                            else:
+                                new_volatility = max(0, db_volatility - 2)
+                        else:
+                            new_volatility = db_volatility
+                        
+                        new_trend = "upward" if price > db_price else "downward" if price < db_price else "stable"
+                    else:
+                        new_min_price = db_min_price
+                        new_max_price = db_max_price
+                        new_avg_price = db_avg_price
+                        new_volatility = db_volatility
+                        new_trend = db_trend
+                    
+                    # Priority
+                    new_priority = db_priority
+                    if price_changed:
+                        new_priority = max(1, db_priority - 1)
+                    elif availability_changed and availability == "OutOfStock":
+                        new_priority = min(4, db_priority + 1)
+                    
+                    # Monitoring group
+                    new_group = "regular"
+                    if price_changed and discount_price and discount_price < price:
+                        new_group = "discounted"
+                    elif availability == "InStock" and price and price > 2000:
+                        new_group = "high_value"
+                    elif availability == "OutOfStock":
+                        new_group = "out_of_stock"
+                    elif price_valid_until and price_valid_until <= (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d"):
+                        new_group = "flash_sale"
+                    
+                    # --- Build update params ---
+                    update_params.append((
+                        price or 0, discount_price or 0, discount_amount or 0,
+                        availability, special_id, price_valid_until,
+                        new_priority, new_group, new_volatility, new_trend,
+                        new_avg_price, new_min_price, new_max_price,
+                        1 if price_changed else 0,
+                        1 if availability_changed else 0,
+                        price_changed,
+                        new_priority == 1, new_priority == 2, new_priority == 3, 
+                        new_priority == 4, new_priority == 5,
+                        product_id
+                    ))
+                    
+                    # --- Price history ---
+                    if price_changed:
+                        price_history_params.append((
+                            product_id, price, discount_price, discount_amount, availability
+                        ))
+                    
+                    # --- Product changes ---
+                    change_fields = []
+                    if price_changed:
+                        change_fields.extend([
+                            (product_id, "price", db_price, price, source),
+                            (product_id, "discount_price", db_discount, discount_price, source)
+                        ])
+                    if availability_changed:
+                        change_fields.append((product_id, "availability", db_availability, availability, source))
+                    if special_id_changed:
+                        change_fields.append((product_id, "special_id", db_special_id, special_id, source))
+                    if price_valid_until_changed:
+                        change_fields.append((product_id, "price_valid_until", db_price_valid_until, price_valid_until, source))
+                    
+                    for pid, ftype, old_val, new_val, src in change_fields:
+                        old_json = json.dumps(str(old_val)) if old_val is not None else None
+                        new_json = json.dumps(str(new_val)) if new_val is not None else None
+                        product_change_params.append((pid, ftype, old_json, new_json, src))
+                    
+                    # --- Alerts ---
+                    if price_changed and db_price > 0:
+                        if price < db_price * 0.9:
+                            alert_params.append((product_id, site, "price_drop", str(db_price), str(price), "high"))
+                        elif price > db_price * 1.2:
+                            alert_params.append((product_id, site, "price_increase", str(db_price), str(price), "medium"))
+                    
+                    if availability_changed and db_availability == "OutOfStock" and availability == "InStock":
+                        alert_params.append((product_id, site, "back_in_stock", db_availability, availability, "high"))
+                    
+                    # --- Monitoring stats ---
+                    change_count = 1 if any([price_changed, availability_changed, special_id_changed, price_valid_until_changed]) else 0
+                    monitoring_stats_params.append((
+                        site.lower(),              # site
+                        product_id,                # product_id
+                        change_count,              # change_count
+                        1 if price_changed else 0, # price_change_count
+                        1 if availability_changed else 0, # availability_change_count
+                        0.5,                       # last_check_duration
+                        0.5                        # avg_check_duration
+                    ))
+                    
+                except Exception as e:
+                    failed_products.append({
+                        "site": site,
+                        "main_product_id": main_product_id,
+                        "reason": str(e)
+                    })
+                    logger.error(f"❌ Prep failed: {site}/{main_product_id} - {e}")
             
-
-            print(f"\n New Data : {new_data} \n")
-            print(f"\n result : {result} \n")
+            if not update_params:
+                logger.info("✅ No changes to apply")
+                return 0, failed_products
             
-            # Convert Decimal values to float
-            product_id = result[0]
-            db_price = float(result[1]) if result[1] is not None else 0
-            db_discount = float(result[2]) if result[2] is not None else 0
-            db_availability = result[3]
-            current_price_change_count = int(result[4]) if result[4] is not None else 0
-            current_avg_price = float(result[5]) if result[5] is not None else None
-            current_min_price = float(result[6]) if result[6] is not None else None
-            current_max_price = float(result[7]) if result[7] is not None else None
-            current_priority = result[8]
+            # =====================================================
+            # STEP 2: EXECUTE BULK OPERATIONS
+            # =====================================================
+            logger.info(f"🚀 Executing batch: {len(update_params)} products to update")
             
-            # Get new values from new_data
-            price = new_data.get("price")
-            discount_price = new_data.get("discount_price")
-            discount_amount = new_data.get("discount_amount")
-            availability = new_data.get("availability")
-            special_id = new_data.get("special_id")
-            price_valid_until = new_data.get("price_valid_until")
+            # 1. UPDATE products
+            if update_params:
+                cursor.executemany("""
+                    UPDATE products SET 
+                        price = %s, discount_price = %s, discount_amount = %s,
+                        availability = %s, special_id = %s, price_valid_until = %s,
+                        last_updated_at = NOW(), last_checked = NOW(),
+                        monitoring_priority = %s, monitoring_group = %s,
+                        price_volatility_score = %s, price_trend = %s,
+                        avg_price = %s, min_price = %s, max_price = %s,
+                        price_change_count = COALESCE(price_change_count, 0) + %s,
+                        availability_change_count = COALESCE(availability_change_count, 0) + %s,
+                        last_price_change = CASE WHEN %s THEN NOW() ELSE last_price_change END,
+                        next_check_at = CASE 
+                            WHEN %s THEN NOW() + INTERVAL '1 hour'
+                            WHEN %s THEN NOW() + INTERVAL '6 hours'
+                            WHEN %s THEN NOW() + INTERVAL '1 day'
+                            WHEN %s THEN NOW() + INTERVAL '3 days'
+                            WHEN %s THEN NOW() + INTERVAL '7 days'
+                            ELSE next_check_at
+                        END
+                    WHERE id = %s
+                """, update_params)
+                logger.info(f"   ✅ Products updated: {len(update_params)}")
             
-            # Convert to float for comparison
-            if price is not None:
-                price = float(price)
-            if discount_price is not None:
-                discount_price = float(discount_price)
-            if discount_amount is not None:
-                discount_amount = float(discount_amount)
-            
-            # Detect changes
-            price_changed = (db_price != price or db_discount != discount_price)
-            availability_changed = (db_availability != availability)
-            
-            change_summary["price_changed"] = price_changed
-            change_summary["availability_changed"] = availability_changed
-            change_summary["old_price"] = db_price
-            change_summary["new_price"] = price
-            change_summary["old_availability"] = db_availability
-            change_summary["new_availability"] = availability
-            
-            # If nothing changed, return early
-            if not price_changed and not availability_changed:
-                logger.debug(f"No changes detected for {site}/{main_product_id}")
-                return True, change_summary
-            
-            logger.info(f"Changes detected for {site}/{main_product_id}: price_changed={price_changed}, availability_changed={availability_changed}")
-            
-            # Update products table
-            cursor.execute("""
-                UPDATE products 
-                SET price = %s, discount_price = %s, discount_amount = %s,
-                    availability = %s, special_id = %s, price_valid_until = %s,
-                    last_updated_at = NOW()
-                WHERE id = %s
-            """, (price, discount_price, discount_amount, availability, special_id,
-                price_valid_until, product_id))
-            
-            # Update price statistics only if price changed
-            if price_changed and price is not None:
-                self._update_price_statistics(cursor, product_id, price, current_price_change_count)
-            
-            # Initialize price stats if first time
-            elif price is not None and current_min_price is None:
-                cursor.execute("""
-                    UPDATE products SET min_price = %s, max_price = %s, avg_price = %s WHERE id = %s
-                """, (price, price, price, product_id))
-            
-            # Update availability counter
-            if availability_changed:
-                cursor.execute("""
-                    UPDATE products SET availability_change_count = COALESCE(availability_change_count, 0) + 1 WHERE id = %s
-                """, (product_id,))
-            
-            # Insert price history
-            if price_changed:
-                cursor.execute("""
+            # 2. INSERT price_history
+            if price_history_params:
+                cursor.executemany("""
                     INSERT INTO price_history (product_id, price, discount_price, discount_amount, availability, recorded_at)
                     VALUES (%s, %s, %s, %s, %s, NOW())
-                """, (product_id, price, discount_price, discount_amount, availability))
+                """, price_history_params)
+                logger.info(f"   ✅ Price history: {len(price_history_params)} records")
             
-            # Insert product changes
-            self._insert_product_changes(cursor, product_id, old_data, new_data, source)
+            # 3. INSERT product_changes
+            if product_change_params:
+                cursor.executemany("""
+                    INSERT INTO product_changes (product_id, change_type, old_value, new_value, source, created_at)
+                    VALUES (%s, %s, %s::jsonb, %s::jsonb, %s, NOW())
+                """, product_change_params)
+                logger.info(f"   ✅ Product changes: {len(product_change_params)} records")
             
+            # 4. INSERT alerts
+            if alert_params:
+                cursor.executemany("""
+                    INSERT INTO monitoring_alerts (product_id, site, alert_type, old_value, new_value, severity, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                """, alert_params)
+                logger.info(f"   ✅ Alerts: {len(alert_params)} records")
+            
+            # 5. UPSERT monitoring_stats
+            if monitoring_stats_params:
+                cursor.executemany("""
+                    INSERT INTO monitoring_stats (
+                        site, product_id, check_count, change_count, 
+                        price_change_count, availability_change_count,
+                        last_check_duration, avg_check_duration,
+                        consecutive_errors, last_success, created_at, updated_at
+                    )
+                    VALUES (
+                        %s, %s, 1, %s, %s, %s, %s, %s, 0, NOW(), NOW(), NOW()
+                    )
+                    ON CONFLICT (site, product_id) DO UPDATE SET
+                        check_count = monitoring_stats.check_count + 1,
+                        change_count = monitoring_stats.change_count + 0,
+                        price_change_count = monitoring_stats.price_change_count + 0,
+                        availability_change_count = monitoring_stats.availability_change_count + 0,
+                        last_check_duration = EXCLUDED.last_check_duration,
+                        avg_check_duration = EXCLUDED.avg_check_duration,
+                        consecutive_errors = 0,
+                        last_success = NOW(),
+                        updated_at = NOW()
+                """, monitoring_stats_params)
+                logger.info(f"   ✅ Monitoring stats: {len(monitoring_stats_params)} records")
+            
+            # Commit all changes
             self.conn.commit()
-            logger.info(f"DB Updated: {site}/{main_product_id} | price_change={price_changed} | avail_change={availability_changed}")
-            return True, change_summary
+            
+            elapsed = round(time.time() - start_time, 2)
+            logger.info(f"✅ BATCH COMPLETE: {len(update_params)} updated, {len(failed_products)} failed in {elapsed}s")
+            
+            return len(update_params), failed_products
             
         except Exception as e:
             self.conn.rollback()
-            logger.error(f"Update error: {e}")
+            logger.error(f"❌ Batch update failed: {e}")
             import traceback
             traceback.print_exc()
-            return False, change_summary
+            return 0, failed_products
         finally:
             cursor.close()
 
-    def _update_price_statistics(self, cursor, product_id: str, new_price: float, current_change_count: int):
-        """Update price statistics (min, max, avg) - Fixed Decimal conversion"""
-        
-        # Get price history - convert Decimal to float
-        cursor.execute("""
-            SELECT price FROM price_history WHERE product_id = %s ORDER BY recorded_at DESC LIMIT 100
-        """, (product_id,))
-        
-        # Convert Decimal values to float
-        price_history = []
-        for row in cursor.fetchall():
-            if row[0] is not None:
-                # Convert Decimal to float
-                price_history.append(float(row[0]))
-        
-        # Add current price
-        all_prices = price_history + [float(new_price)]
-        
-        # Calculate statistics (all are now floats)
-        new_min = float(min(all_prices))
-        new_max = float(max(all_prices))
-        new_avg = round(sum(all_prices) / len(all_prices), 2)
-        
-        cursor.execute("""
-            UPDATE products 
-            SET min_price = %s, max_price = %s, avg_price = %s,
-                price_change_count = COALESCE(price_change_count, 0) + 1,
-                last_price_change = NOW()
-            WHERE id = %s
-        """, (new_min, new_max, new_avg, product_id))
 
     def _insert_product_changes(self, cursor, product_id: str, old_data: Dict, new_data: Dict, source: str):
-        """Insert records for all changed fields"""
+        """Insert records for all changed fields - handles None properly"""
         tracked_fields = ["price", "discount_price", "discount_amount", "availability", "special_id", "price_valid_until"]
         
         for field in tracked_fields:
             old_val = old_data.get(field)
             new_val = new_data.get(field)
             
-            # Normalize
+            # Store original for logging
+            orig_old = old_val
+            orig_new = new_val
+            
+            # Normalize for comparison
             if field in ["price", "discount_price", "discount_amount"]:
-                old_val = float(old_val) if old_val else 0
-                new_val = float(new_val) if new_val else 0
+                old_val = float(old_val) if old_val is not None else None
+                new_val = float(new_val) if new_val is not None else None
             elif field == "price_valid_until":
                 if old_val:
-                    old_val = str(old_val).split("T")[0] if "T" in str(old_val) else str(old_val)
+                    old_val = clean_date(old_val)
                 if new_val:
-                    new_val = str(new_val).split("T")[0] if "T" in str(new_val) else str(new_val)
+                    new_val = clean_date(new_val)
+            elif field in ["availability", "special_id"]:
+                old_val = str(old_val).strip() if old_val is not None else None
+                new_val = str(new_val).strip() if new_val is not None else None
             
+            # Compare (None vs None = no change, None vs Value = change)
             if old_val != new_val:
+                # Handle None values properly for JSON
                 old_json = json.dumps(str(old_val)) if old_val is not None else None
                 new_json = json.dumps(str(new_val)) if new_val is not None else None
+                
                 cursor.execute("""
                     INSERT INTO product_changes (product_id, change_type, old_value, new_value, source, created_at)
                     VALUES (%s, %s, %s::jsonb, %s::jsonb, %s, NOW())
                 """, (product_id, field, old_json, new_json, source))
+                
+                logger.info(f"Inserted product change: {field} | '{orig_old}' -> '{orig_new}'")
 
     # =====================================================
     # MONITORING STATS

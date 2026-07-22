@@ -28,21 +28,25 @@ def open_new_terminal(command):
         # Create a temporary batch file
         bat_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "temp_monitor.bat")
         
-        # Write the batch file content
+        # Write the batch file content with cleaner UI
         bat_content = f'''@echo off
 title Monitoring System
 color 0A
+echo.
 echo ============================================================
 echo     TUNISIAN TECH PRODUCTS MONITORING SYSTEM
 echo ============================================================
 echo.
+echo [INFO] Starting monitoring system...
+echo.
 {command}
 echo.
 echo ============================================================
-echo Monitoring system closed.
+echo [SUCCESS] Monitoring system closed.
 echo ============================================================
 echo.
-pause
+echo Press any key to close this window...
+pause > nul
 del "%~f0"
 '''
         
@@ -53,9 +57,34 @@ del "%~f0"
         subprocess.Popen(f'start "Monitoring System" cmd /c "{bat_path}"', shell=True)
         
     elif system == "Linux":
-        command = f'{command}; read -p "Press Enter to close..."'
+        command = f'''
+echo "============================================================"
+echo "    TUNISIAN TECH PRODUCTS MONITORING SYSTEM"
+echo "============================================================"
+echo.
+{command}
+echo.
+echo "============================================================"
+echo "✅ Monitoring system closed."
+echo "============================================================"
+echo.
+echo "Press Enter to close..."
+read'''
         subprocess.Popen(["gnome-terminal", "--", "bash", "-c", command])
     elif system == "Darwin":  # macOS
+        command = f'''
+echo "============================================================"
+echo "    TUNISIAN TECH PRODUCTS MONITORING SYSTEM"
+echo "============================================================"
+echo.
+{command}
+echo.
+echo "============================================================"
+echo "✅ Monitoring system closed."
+echo "============================================================"
+echo.
+echo "Press any key to close..."
+read'''
         subprocess.Popen(["osascript", "-e", f'tell application "Terminal" to do script "{command}"'])
 
 

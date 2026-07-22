@@ -101,11 +101,11 @@ class MonitorEngine:
         return products
 
     # ---------------------------------
-    # MONITOR CYCLE (USING WORKER POOL)
+    # MONITOR CYCLE (WITH PAUSE/STOP SUPPORT)
     # ---------------------------------
-    def monitor_cycle(self, site: str, workers: int = 20, show_progress: bool = True, stop_event: threading.Event = None) -> dict:
+    def monitor_cycle(self, site: str, workers: int = 20, show_progress: bool = True, stop_event: threading.Event = None, pause_event: threading.Event = None) -> dict:
         """
-        Run one monitoring cycle with progress bar
+        Run one monitoring cycle with adaptive batch processing, stop and pause event checking
         """
         start = time.time()
         site = site.lower()
@@ -140,6 +140,7 @@ class MonitorEngine:
         error_count = 0
         completed = 0
         stopped = False
+        paused = False
         
         # Create progress bar
         progress = None
@@ -150,41 +151,124 @@ class MonitorEngine:
                 prefix=f"🔍 {site.upper()}"
             )
         
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {
-                executor.submit(worker, product, self.processor): product
-                for product in products
-            }
+        # Process products in smaller batches to check pause/stop more frequently
+        BATCH_SIZE = 50  # Process 50 products at a time
+        total_batches = (total + BATCH_SIZE - 1) // BATCH_SIZE
+        
+        for batch_idx in range(total_batches):
+            # =====================================================
+            # CHECK STOP AND PAUSE EVENTS BEFORE EACH BATCH
+            # =====================================================
+            if stop_event and stop_event.is_set():
+                stopped = True
+                logger.info(f"{site} | STOP_SIGNAL_RECEIVED | stopping cycle")
+                break
             
-            for future in as_completed(futures):
-                # Check if we need to stop
+            if pause_event and pause_event.is_set():
+                paused = True
+                logger.info(f"{site} | PAUSE_SIGNAL_RECEIVED | pausing cycle")
+                
+                # Update progress bar to show paused state
+                if progress:
+                    progress.update(completed, "⏸️ PAUSED")
+                
+                # Wait until pause is cleared or stop is set
+                while pause_event.is_set() and not (stop_event and stop_event.is_set()):
+                    time.sleep(1)
+                
                 if stop_event and stop_event.is_set():
                     stopped = True
                     break
                 
-                try:
-                    result = future.result(timeout=60)
-                    if result:
-                        changed_count += 1
-                        # Track changed product for recap
-                        product = futures[future]
-                        self.changed_products.append({
-                            "product_id": product.get("main_product_id"),
-                            "url": product.get("url"),
-                            "price": product.get("price")
-                        })
-                    else:
-                        no_change_count += 1
-                except Exception as e:
-                    error_count += 1
-                    logger.error(f"{site} | WORKER_ERROR | {e}")
-                
-                completed += 1
-                
-                # Update progress bar with stats
+                # Resume processing
+                logger.info(f"{site} | RESUME_SIGNAL_RECEIVED | resuming cycle")
                 if progress:
-                    extra_info = f"✓ {changed_count} | ○ {no_change_count} | ✗ {error_count}"
-                    progress.update(completed, extra_info)
+                    progress.update(completed, "▶️ RESUMED")
+            
+            # Get batch of products
+            start_idx = batch_idx * BATCH_SIZE
+            end_idx = min(start_idx + BATCH_SIZE, total)
+            batch_products = products[start_idx:end_idx]
+            
+            # Process batch
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {
+                    executor.submit(worker, product, self.processor): product
+                    for product in batch_products
+                }
+                
+                for future in as_completed(futures):
+                    # =====================================================
+                    # CHECK STOP/PAUSE EVENTS DURING BATCH PROCESSING
+                    # =====================================================
+                    if stop_event and stop_event.is_set():
+                        stopped = True
+                        logger.info(f"{site} | STOP_SIGNAL_RECEIVED | stopping during batch")
+                        # Cancel remaining futures
+                        for f in futures:
+                            f.cancel()
+                        break
+                    
+                    if pause_event and pause_event.is_set():
+                        paused = True
+                        logger.info(f"{site} | PAUSE_SIGNAL_RECEIVED | pausing during batch")
+                        
+                        # Cancel remaining futures
+                        for f in futures:
+                            f.cancel()
+                        
+                        # Update progress bar
+                        if progress:
+                            progress.update(completed, "⏸️ PAUSED")
+                        
+                        # Wait until pause is cleared or stop is set
+                        while pause_event.is_set() and not (stop_event and stop_event.is_set()):
+                            time.sleep(1)
+                        
+                        if stop_event and stop_event.is_set():
+                            stopped = True
+                            break
+                        
+                        # Resume processing
+                        logger.info(f"{site} | RESUME_SIGNAL_RECEIVED | resuming cycle")
+                        if progress:
+                            progress.update(completed, "▶️ RESUMED")
+                        break  # Break out of batch processing to restart with new batch
+                    
+                    try:
+                        result = future.result(timeout=60)
+                        if result:
+                            changed_count += 1
+                            # Track changed product for recap
+                            product = futures[future]
+                            self.changed_products.append({
+                                "product_id": product.get("main_product_id"),
+                                "url": product.get("url"),
+                                "price": product.get("price")
+                            })
+                        else:
+                            no_change_count += 1
+                    except Exception as e:
+                        error_count += 1
+                        logger.error(f"{site} | WORKER_ERROR | {e}")
+                    
+                    completed += 1
+                    
+                    # Update progress bar with stats
+                    if progress:
+                        extra_info = f"✓ {changed_count} | ○ {no_change_count} | ✗ {error_count}"
+                        progress.update(completed, extra_info)
+                    
+                    # If we broke due to pause, break out of the for loop
+                    if paused:
+                        break
+                
+                # If we broke due to stop or pause, break out of batch loop
+                if stopped:
+                    break
+                if paused:
+                    paused = False  # Reset paused flag after resuming
+                    continue  # Continue to next batch
         
         # Close progress bar
         if progress:
@@ -216,7 +300,19 @@ class MonitorEngine:
         )
         
         # =====================================================
-        # LOG CYCLE RECAP TO RECAP FILE (not debug)
+        # FLUSH PENDING BATCHES
+        # =====================================================
+        site_flush_count = self.processor.flush_site(site)
+        if site_flush_count > 0:
+            logger.info(f"{site} | SITE_FLUSH | {site_flush_count} products updated")
+        
+        # Also flush any remaining global batches
+        global_flush_results = self.processor.flush_all()
+        if global_flush_results:
+            logger.info(f"{site} | GLOBAL_FLUSH | {sum(global_flush_results.values())} products updated across {len(global_flush_results)} sites")
+        
+        # =====================================================
+        # LOG CYCLE RECAP TO RECAP FILE
         # =====================================================
         cycle_stats = {
             "cycle_type": "monitoring",
@@ -228,29 +324,16 @@ class MonitorEngine:
             "error_count": error_count,
             "total_changed_products": len(self.changed_products),
             "changed_products_sample": self.changed_products[:10],
+            "batch_stats": self.processor.get_stats(),
             "timestamp": datetime.now().isoformat()
         }
         
-        # Log to recap file using log_scrape_stats (which writes to recap)
-        log_scrape_stats(
-            site=site,
-            stats=cycle_stats
-        )
+        # Log to recap file
+        log_scrape_stats(site=site, stats=cycle_stats)
         
-        # Also log changed products specifically to recap
-        if self.changed_products:
-            # Create a detailed recap entry for changed products
-            changed_summary = {
-                "cycle_type": "changed_products_detail",
-                "site": site,
-                "total_changed": len(self.changed_products),
-                "changed_products": self.changed_products[:20],  # First 20
-                "timestamp": datetime.now().isoformat()
-            }
-            log_scrape_stats(
-                site=site,
-                stats=changed_summary
-            )
+        # Get batch stats for return
+        batch_stats = self.processor.get_stats()
+        logger.info(f"{site} | BATCH_STATS | {batch_stats}")
         
         return {
             "site": site,
@@ -260,21 +343,24 @@ class MonitorEngine:
             "errors": error_count,
             "time": elapsed,
             "stopped": stopped,
+            "paused": paused,
             "timestamp": datetime.now().isoformat(),
-            "changed_products": self.changed_products[:10]
+            "changed_products": self.changed_products[:10],
+            "batch_stats": batch_stats
         }
 
     # ---------------------------------
     # RUN LOOP
     # ---------------------------------
-    def run(self, site: str, workers: int = 20, interval: int = 300):
+    def run(self, site: str, workers: int = 20, interval: int = 300, pause_event: threading.Event = None):
         """
-        Run continuous monitoring loop
+        Run continuous monitoring loop with pause support
         
         Args:
             site: Site name (e.g., 'megapc')
             workers: Number of worker threads
             interval: Sleep interval between cycles in seconds
+            pause_event: Event to pause monitoring
         """
         site = site.lower()
         
@@ -289,12 +375,23 @@ class MonitorEngine:
         while True:
             cycle_count += 1
             
+            # Check if paused before starting new cycle
+            if pause_event and pause_event.is_set():
+                logger.info(f"{site} | PAUSED | waiting for resume...")
+                while pause_event.is_set():
+                    time.sleep(1)
+                logger.info(f"{site} | RESUMED | continuing monitoring...")
+            
             try:
                 logger.info(f"{site} | CYCLE_{cycle_count} | STARTING")
+                self.processor = ResultProcessor()  # Fresh processor per cycle
                 
                 stats = self.monitor_cycle(
                     site=site,
-                    workers=workers
+                    workers=workers,
+                    show_progress=True,
+                    stop_event=None,
+                    pause_event=pause_event
                 )
                 
                 logger.info(
@@ -306,15 +403,112 @@ class MonitorEngine:
             except Exception as e:
                 logger.error(f"{site} | MONITOR_LOOP_ERROR | {e}")
             
+            # Check pause before sleeping
+            if pause_event and pause_event.is_set():
+                continue
+            
             logger.info(f"{site} | SLEEPING | {interval}s")
             time.sleep(interval)
 
     # ---------------------------------
-    # MONITOR SITE CONTINUOUS
+    # RUN SITE (Single site)
+    # ---------------------------------
+    def run_site(self, site: str, workers: int = None, interval: int = None, show_progress: bool = True):
+        """
+        Run monitoring for a specific site
+        
+        Args:
+            site: Site name
+            workers: Number of workers (overrides config)
+            interval: Check interval in seconds (overrides config)
+            show_progress: Show progress bar
+        """
+        site = site.lower()
+        
+        if site not in SITE_WORKERS:
+            print(f"\n❌ Site '{site}' not registered!")
+            print(f"   Available sites: {', '.join(SITE_WORKERS.keys())}")
+            return
+        
+        # Update config if overrides provided
+        if workers:
+            update_site_config(site, workers=workers)
+        if interval:
+            update_site_config(site, interval=interval)
+        
+        # Run monitoring (without stop_event for single site mode)
+        config = get_site_config(site)
+        interval = config.get("interval", 300)
+        workers = config.get("workers", 20)
+        
+        cycle_count = 0
+        
+        print(f"\n{'='*60}")
+        print(f"🚀 STARTING MONITORING: {site.upper()}")
+        print(f"   Workers: {workers} | Interval: {interval}s")
+        print(f"   Press Ctrl+C to stop")
+        print(f"{'='*60}\n")
+        
+        try:
+            while True:
+                cycle_count += 1
+                
+                print(f"\n{'─'*60}")
+                print(f"🔄 {site.upper()} | CYCLE #{cycle_count} | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                print(f"{'─'*60}")
+                
+                stats = self.monitor_cycle(site=site, workers=workers, show_progress=show_progress)
+                
+                print(f"\n   📈 Cycle #{cycle_count} Statistics:")
+                print(f"      📦 Products: {stats['total']}")
+                print(f"      🔄 Changes: {stats['changed']}")
+                print(f"      ❌ Errors: {stats['errors']}")
+                print(f"      ⏱️ Duration: {stats['time']}s")
+                
+                # Show changed products sample
+                changed_products = stats.get('changed_products', [])
+                if changed_products:
+                    print(f"\n   📝 Changed products (sample):")
+                    for i, prod in enumerate(changed_products[:5], 1):
+                        print(f"      {i}. {prod['product_id']} - Price: {prod['price']} TND")
+                    if len(changed_products) > 5:
+                        print(f"      ... and {len(changed_products) - 5} more")
+                
+                print(f"\n   💤 Sleeping for {interval}s...")
+                time.sleep(interval)
+                
+        except KeyboardInterrupt:
+            print(f"\n\n🛑 Monitoring stopped for {site.upper()}")
+
+    # ---------------------------------
+    # RUN ALL SITES
+    # ---------------------------------
+    def run_all(self):
+        """Run monitoring for all enabled sites"""
+        from monitoring.engine.site_registry import get_enabled_sites
+        
+        enabled_sites = get_enabled_sites()
+        
+        if not enabled_sites:
+            print("\n❌ No enabled sites found!")
+            return
+        
+        print(f"\n{'='*60}")
+        print("🚀 RUNNING ALL ENABLED SITES")
+        print(f"{'='*60}")
+        print(f"📋 Sites: {', '.join([s.upper() for s in enabled_sites])}")
+        print(f"{'='*60}\n")
+        
+        for site in enabled_sites:
+            print(f"\n▶️ Starting: {site.upper()}")
+            self.run_site(site)
+
+    # ---------------------------------
+    # MONITOR SITE CONTINUOUS (For controller)
     # ---------------------------------
     def monitor_site_continuous(self, site: str, stop_event: threading.Event = None):
         """
-        Continuously monitor a single site with stop event
+        Continuously monitor a single site with stop event (for controller)
         """
         site = site.lower()
         config = get_site_config(site)
@@ -338,11 +532,18 @@ class MonitorEngine:
             print(f"{'─'*50}")
             
             try:
+                # Create a pause event for this site if needed
+                # (pause_event is managed by controller)
+                pause_event = None
+                if hasattr(self, 'pause_events') and site in self.pause_events:
+                    pause_event = self.pause_events[site]
+                
                 stats = self.monitor_cycle(
                     site=site, 
                     workers=workers, 
                     show_progress=True,
-                    stop_event=stop_event
+                    stop_event=stop_event,
+                    pause_event=pause_event
                 )
                 
                 # If cycle was stopped, break out

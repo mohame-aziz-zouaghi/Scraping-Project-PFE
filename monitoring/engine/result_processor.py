@@ -1,20 +1,38 @@
 # monitoring/engine/result_processor.py
 from datetime import datetime, timedelta
+from typing import List, Dict, Optional, Tuple
 from Database.Redis.product_cache import ProductCache
 from Database.Postgresql.db import Database
+from monitoring.engine.adaptive_batch_processor import AdaptiveBatchProcessor
 from core.logger import setup_logger
+from core.utils.clean_date_logic import clean_date
 from core.utils.debug_logger import log_debug, log_product_check, log_change_comparison
 
 logger = setup_logger("monitor_changes", "monitor")
 
 
 class ResultProcessor:
-    """Process monitoring results - orchestrates between Redis cache and PostgreSQL"""
-
-    def __init__(self):
+    """
+    Process monitoring results - Redis immediate, PostgreSQL batched using AdaptiveBatchProcessor
+    
+    Architecture:
+    - Redis: Updated immediately with essential fields only (real-time)
+    - PostgreSQL: Updated in batches using AdaptiveBatchProcessor
+    - Adaptive batching: 50 per site OR 100 global OR 60s timeout
+    - Background timer checks every 10 seconds
+    """
+    
+    def __init__(self, batch_processor: AdaptiveBatchProcessor = None):
         self.cache = ProductCache()
         self.db = Database()
+        self.batch_processor = batch_processor or AdaptiveBatchProcessor(self.db)
+        self.total_processed = 0
+        self.total_changes = 0
 
+    # =====================================================
+    # NORMALIZATION HELPERS
+    # =====================================================
+    
     def _normalize_value(self, field: str, value):
         """Normalize values for accurate comparison"""
         if value is None:
@@ -28,10 +46,7 @@ class ResultProcessor:
         
         if field == "price_valid_until":
             if value:
-                date_str = str(value)
-                if 'T' in date_str:
-                    date_str = date_str.split('T')[0]
-                return date_str.strip()
+                return clean_date(value)
             return None
         
         if field in ["availability", "special_id"]:
@@ -40,22 +55,37 @@ class ResultProcessor:
         return value
 
     def _log_change_details(self, site: str, product_id: str, old_value, new_value, field: str):
+        """Log detailed field change"""
         logger.warning(f"{site} | FIELD_CHANGED | {product_id} | {field} | '{old_value}' -> '{new_value}'")
 
+    # =====================================================
+    # MAIN PROCESSING
+    # =====================================================
+    
     def process(self, site: str, main_product_id: str, new_data: dict) -> bool:
         """
-        Process monitoring result - coordinates Redis and PostgreSQL updates
+        Process monitoring result - Redis immediate, PostgreSQL batched adaptively
+        
+        Args:
+            site: Site name (e.g., 'megapc')
+            main_product_id: Product ID from the source site
+            new_data: Newly scraped product data
+        
+        Returns:
+            True if changes were detected and saved, False otherwise
         """
         try:
-            # Get old data from Redis
+            # Get old data from Redis (now returns minimal payload)
             old_data = self.cache.get_product(site, main_product_id)
+            
+            # Validate old_data
+            if old_data is not None and not isinstance(old_data, dict):
+                old_data = None
             
             # First time seeing this product
             if not old_data:
                 logger.warning(f"{site} | FIRST_CACHE_SAVE | {main_product_id}")
                 self.cache.set_product(site, main_product_id, new_data)
-                
-                # Log first time product
                 log_product_check(
                     product_id=main_product_id,
                     site=site,
@@ -69,28 +99,19 @@ class ResultProcessor:
             tracked_fields = ["price", "discount_price", "discount_amount", "availability", "special_id", "price_valid_until"]
             
             for field in tracked_fields:
-                old_value = self._normalize_value(field, old_data.get(field))
-                new_value = self._normalize_value(field, new_data.get(field))
+                old_value = self._normalize_value(field, old_data.get(field) if isinstance(old_data, dict) else None)
+                new_value = self._normalize_value(field, new_data.get(field) if isinstance(new_data, dict) else None)
                 if old_value != new_value:
                     changed_fields.append({"field": field, "old": old_value, "new": new_value})
                     logger.debug(f"{site} | CHANGE_DETECTED: {field}")
             
+            # No changes detected
             if not changed_fields:
-                logger.debug(f"{site} | NO_CHANGE | {main_product_id}")
-                
-                # Log no change (less verbose - only log occasionally)
-                if old_data.get("check_count", 0) % 50 == 0:
-                    log_debug(
-                        f"No change for {site}/{main_product_id}",
-                        {"price": old_data.get("price"), "availability": old_data.get("availability")}
-                    )
                 return False
             
             logger.info(f"{site} | CHANGES_FOUND | {main_product_id} | fields={len(changed_fields)}")
             
-            # =====================================================
-            # DEBUG LOG: Log change comparison for debugging
-            # =====================================================
+            # Log change comparison for debugging
             log_change_comparison(
                 product_id=main_product_id,
                 cached_product=old_data,
@@ -102,167 +123,46 @@ class ResultProcessor:
             # Determine change types
             is_price_change = any(c["field"] in ["price", "discount_price", "discount_amount"] for c in changed_fields)
             is_availability_change = any(c["field"] == "availability" for c in changed_fields)
+            is_special_id_change = any(c["field"] == "special_id" for c in changed_fields)
+            is_valid_until_change = any(c["field"] == "price_valid_until" for c in changed_fields)
             
             # =====================================================
-            # STEP 1: UPDATE REDIS CACHE
+            # STEP 1: UPDATE REDIS CACHE (IMMEDIATE - MINIMAL PAYLOAD)
             # =====================================================
+            # Only update essential fields in Redis
             self.cache.set_product(site, main_product_id, new_data)
-            self.cache.increment_check_count(site, main_product_id, True, is_price_change, is_availability_change, 0.5)
             
+            # Update last_checked timestamp
+            self.cache.update_last_checked(site, main_product_id)
+            
+            # If price changed, update price volatility in Redis
             if is_price_change:
                 new_price = float(new_data.get("price", 0))
-                self.db.update_price_volatility(site, main_product_id, new_price)
+                # Note: price volatility is now stored in PostgreSQL only
+                # Redis only stores the current price
+                pass
             
             logger.info(f"{site} | REDIS_UPDATED | {main_product_id}")
             
             # =====================================================
-            # STEP 2: UPDATE POSTGRESQL (ALL DB OPERATIONS IN ONE CALL)
+            # STEP 2: ADD TO ADAPTIVE BATCH PROCESSOR (POSTGRESQL)
             # =====================================================
-            success, change_summary = self.db.update_product_with_monitoring_data(
-                site=site,
-                main_product_id=main_product_id,
-                old_data=old_data,
-                new_data=new_data,
-                source=site
-            )
-            
-            # Reset check_failures on successful update (product is accessible)
-            if success and main_product_id:
-                self.db.reset_check_failures(main_product_id, site)
-                logger.debug(f"{site} | FAILURES_RESET | {main_product_id}")
-
-
-            if not success:
-                logger.error(f"{site} | DB_UPDATE_FAILED | {main_product_id}")
-                
-                # Log DB update failure
-                log_debug(
-                    f"DB update failed for {site}/{main_product_id}",
-                    {"error": "DB_UPDATE_FAILED", "fields": [c["field"] for c in changed_fields]}
-                )
-                return False
+            # All detailed monitoring stats are updated in PostgreSQL via batch
+            self.batch_processor.add_update(site, main_product_id, old_data, new_data, site)
             
             # =====================================================
-            # STEP 3: UPDATE MONITORING STATS
+            # STEP 3: LOG CHANGES
             # =====================================================
-            self.db.increment_monitoring_stats(
-                site=site, main_product_id=main_product_id,
-                has_change=True, is_price_change=is_price_change,
-                is_availability_change=is_availability_change, duration=0.5
-            )
-            
-            # =====================================================
-            # STEP 4: UPDATE PRICE VOLATILITY IN POSTGRESQL
-            # =====================================================
-            if is_price_change:
-                new_price = float(new_data.get("price", 0))
-                self.db.update_price_volatility(site, main_product_id, new_price)
-                logger.info(f"{site} | DB_PRICE_VOLATILITY_UPDATED | {main_product_id}")
-            
-            # =====================================================
-            # STEP 5: UPDATE NEXT CHECK TIME
-            # =====================================================
-            product = self.db.get_product_by_site_and_main_id(site, main_product_id)
-            if product:
-                priority = product.get("monitoring_priority", 3)
-                intervals = {1: 3600, 2: 21600, 3: 86400, 4: 259200, 5: 604800}
-                next_check = datetime.now() + timedelta(seconds=intervals.get(priority, 86400))
-                self.db.update_next_check_time(site, main_product_id, next_check)
-            
-            # =====================================================
-            # STEP 6: CREATE ALERTS AND AUTO-RESOLVE
-            # =====================================================
-            product_id = product["id"] if product else None
-            
-            # --- CREATE NEW ALERTS ---
-            if is_price_change:
-                old_price = float(old_data.get("price", 0))
-                new_price = float(new_data.get("price", 0))
-                if old_price > 0 and new_price < old_price * 0.9:
-                    self.db.create_monitoring_alert(product_id, site, "price_drop", str(old_price), str(new_price), "high")
-                    logger.warning(f"{site} | ALERT | Price dropped >10%: {old_price} -> {new_price}")
-                    
-                    # Log price drop alert
-                    log_debug(
-                        f"Price drop alert for {site}/{main_product_id}",
-                        {"old_price": old_price, "new_price": new_price, "drop_percent": f"{((old_price - new_price) / old_price * 100):.1f}%"}
-                    )
-                
-                # Also check for price increase alert
-                if old_price > 0 and new_price > old_price * 1.2:
-                    self.db.create_monitoring_alert(product_id, site, "price_increase", str(old_price), str(new_price), "medium")
-                    logger.warning(f"{site} | ALERT | Price increased >20%: {old_price} -> {new_price}")
-                    
-                    # Log price increase alert
-                    log_debug(
-                        f"Price increase alert for {site}/{main_product_id}",
-                        {"old_price": old_price, "new_price": new_price, "increase_percent": f"{((new_price - old_price) / old_price * 100):.1f}%"}
-                    )
-            
-            if is_availability_change:
-                old_avail, new_avail = old_data.get("availability"), new_data.get("availability")
-                if old_avail == "OutOfStock" and new_avail == "InStock":
-                    self.db.create_monitoring_alert(product_id, site, "back_in_stock", old_avail, new_avail, "high")
-                    logger.warning(f"{site} | ALERT | Back in stock: {main_product_id}")
-                    
-                    # Log back in stock alert
-                    log_debug(
-                        f"Back in stock alert for {site}/{main_product_id}",
-                        {"old_availability": old_avail, "new_availability": new_avail}
-                    )
-            
-            # --- AUTO-RESOLVE EXISTING ALERTS ---
-            if product_id:
-                # Resolve price drop alerts when price recovers (within 5%)
-                if is_price_change:
-                    new_price = float(new_data.get("price", 0))
-                    resolved_count = self.db.resolve_price_drop_alerts(product_id, new_price)
-                    if resolved_count > 0:
-                        logger.info(f"{site} | RESOLVED | {resolved_count} price drop alerts")
-                        log_debug(
-                            f"Resolved {resolved_count} price drop alerts for {site}/{main_product_id}",
-                            {"new_price": new_price}
-                        )
-                    
-                    # Resolve price increase alerts when price drops back
-                    resolved_count = self.db.resolve_price_increase_alerts(product_id, new_price)
-                    if resolved_count > 0:
-                        logger.info(f"{site} | RESOLVED | {resolved_count} price increase alerts")
-                        log_debug(
-                            f"Resolved {resolved_count} price increase alerts for {site}/{main_product_id}",
-                            {"new_price": new_price}
-                        )
-                
-                # Resolve back-in-stock alerts when product goes out of stock again
-                if is_availability_change:
-                    new_avail = new_data.get("availability")
-                    resolved_count = self.db.resolve_back_in_stock_alerts(product_id, new_avail)
-                    if resolved_count > 0:
-                        logger.info(f"{site} | RESOLVED | {resolved_count} back-in-stock alerts")
-                        log_debug(
-                            f"Resolved {resolved_count} back-in-stock alerts for {site}/{main_product_id}",
-                            {"new_availability": new_avail}
-                        )
-            
-            # Log product check (successful update)
-            log_product_check(
-                product_id=main_product_id,
-                site=site,
-                action="updated",
-                details={
-                    "changed_fields": [c["field"] for c in changed_fields],
-                    "price_change": is_price_change,
-                    "availability_change": is_availability_change
-                }
-            )
-            
-            # Log changes
             for change in changed_fields:
                 self._log_change_details(site, main_product_id, change["old"], change["new"], change["field"])
+            
+            self.total_processed += 1
+            self.total_changes += len(changed_fields)
             
             logger.info(
                 f"{site} | PROCESSING_COMPLETE | {main_product_id} | "
                 f"price_change={is_price_change} | avail_change={is_availability_change} | "
+                f"special_id_change={is_special_id_change} | valid_until_change={is_valid_until_change} | "
                 f"fields={len(changed_fields)}"
             )
             return True
@@ -271,43 +171,70 @@ class ResultProcessor:
             logger.error(f"{site} | PROCESS_ERROR | {main_product_id} | {e}")
             import traceback
             traceback.print_exc()
-            
-            # Log exception
             log_debug(
                 f"Error processing {site}/{main_product_id}",
                 {"error": str(e), "traceback": traceback.format_exc()}
             )
             return False
-        
+
+    # =====================================================
+    # BATCH MANAGEMENT
+    # =====================================================
+    
+    def flush_site(self, site: str) -> int:
+        """Force flush pending updates for a specific site"""
+        return self.batch_processor.flush_site(site)
+    
+    def flush_all(self) -> Dict[str, int]:
+        """Force flush ALL pending updates"""
+        return self.batch_processor.flush_all()
+    
+    def get_stats(self) -> Dict:
+        """Get processor statistics"""
+        return {
+            "total_processed": self.total_processed,
+            "total_changes": self.total_changes,
+            "batch_stats": self.batch_processor.get_stats()
+        }
+    
+    def close(self):
+        """Clean up resources - flush remaining batch and close connections"""
+        self.batch_processor.close()
+        if self.db:
+            self.db.close()
+
+    # =====================================================
+    # HANDLE FAILED PRODUCT
+    # =====================================================
+    
     def handle_failed_product(self, site: str, main_product_id: str, product_id: str = None) -> bool:
         """
         Handle a product that failed to fetch (404, timeout, etc.)
-        Uses increment_check_failure to handle the logic
-        Returns True if product is now disabled or already disabled
+        
+        Returns:
+            True if product is now disabled or already disabled
         """
         try:
-            # Log failure attempt
             log_debug(
                 f"Handling failed product {site}/{main_product_id}",
                 {"action": "failure_handling_started"}
             )
             
-            # Use the existing method to handle failure
+            # Increment failure count in PostgreSQL (handles disable logic)
             result = self.db.increment_check_failure(main_product_id, site)
             
             failure_count = result.get("failure_count", 0)
             is_disabled = result.get("is_disabled", False)
             
-            # Update Redis cache with failure info
+            # Update Redis cache with failure info (minimal fields)
             product = self.cache.get_product(site, main_product_id)
             if product:
-                product["consecutive_errors"] = failure_count
+                # Update only essential fields in Redis
                 product["check_failures"] = failure_count
                 if is_disabled:
                     product["is_enabled"] = False
                 self.cache.set_product(site, main_product_id, product)
             
-            # Log product check for failure
             log_product_check(
                 product_id=main_product_id,
                 site=site,
@@ -319,7 +246,6 @@ class ResultProcessor:
                 }
             )
             
-            # Log appropriately
             if is_disabled:
                 logger.warning(f"{site} | PRODUCT_DISABLED | {main_product_id} | failures={failure_count}")
                 log_debug(
@@ -335,7 +261,6 @@ class ResultProcessor:
             
         except Exception as e:
             logger.error(f"{site} | HANDLE_FAILURE_ERROR | {main_product_id} | {e}")
-            
             log_debug(
                 f"Error handling failed product {site}/{main_product_id}",
                 {"error": str(e)}

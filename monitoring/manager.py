@@ -15,7 +15,6 @@ from Database.Redis.cache_keys import (
     product_key
 )
 from monitoring.engine.result_processor import ResultProcessor
-from monitoring.extractors.megapc_fast import fast_check_megapc_product
 
 
 logger = setup_logger(
