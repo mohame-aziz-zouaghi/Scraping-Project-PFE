@@ -1,7 +1,6 @@
 from bs4 import BeautifulSoup
-from core.utils.clean_text_parser import clean_text
 from core.logger import setup_logger
-from core.utils.price_parser import parse_price
+from core.utils.clean_text_parser import clean_and_decode_text
 from core.Web.product_schema import create_product_schema
 
 import re
@@ -21,7 +20,7 @@ def parse_mytek_product_page(html, url, site, source ,product_id=None):
     # ---------------------------------
     name_tag = soup.find("h1", class_="page-title")
     if name_tag:
-        product["name"] = clean_text(name_tag.text)
+        product["name"] = clean_and_decode_text(name_tag.text)
 
     # ---------------------------------
     # SKU 
@@ -30,7 +29,7 @@ def parse_mytek_product_page(html, url, site, source ,product_id=None):
 
     if sku_block:
         sku_value = sku_block.find("div", class_="value")
-        product["special_id"] = clean_text(sku_value.text)
+        product["special_id"] = clean_and_decode_text(sku_value.text)
 
     # ---------------------------------
     # AVAILABILITY (CORRECT)
@@ -101,7 +100,7 @@ def parse_mytek_product_page(html, url, site, source ,product_id=None):
         # remove "Retrait..."
         desc = desc.split("Retrait")[0]
 
-        product["description"] = clean_text(desc)
+        product["description"] = clean_and_decode_text(desc)
 
     # ---------------------------------
     # ATTRIBUTES TABLE PARSING
@@ -126,8 +125,8 @@ def parse_mytek_product_page(html, url, site, source ,product_id=None):
             if not th or not td:
                 continue
 
-            key = clean_text(th.text)
-            value = clean_text(td.text)
+            key = clean_and_decode_text(th.text)
+            value = clean_and_decode_text(td.text)
 
             if not value:
                 continue

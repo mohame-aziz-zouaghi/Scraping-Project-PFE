@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 from Database.Redis.product_cache import ProductCache
+from core.utils.clean_text_parser import clean_and_decode_text
 from menu.monitoring_menu import monitoring_menu
 from menu.redis_manager import RedisManager
 from menu.preload_cache import preload_cache
@@ -88,6 +89,7 @@ def menu():
         print("12 - Preoading Data to Redis")
         print("13 - 🗄️  Redis Management (NEW)") 
         print("30 - Start Monitoring Products")
+        print("99 - Clean Text")
         print("0 - Exit")
 
         choice = input("\nChoice: ").strip()
@@ -209,6 +211,10 @@ def menu():
         elif choice == "13":
             redis_manager = RedisManager()
             redis_manager.show_menu()
+
+        elif choice =="99":
+            text = input("Enter product URL: ").strip()
+            print (clean_and_decode_text(text)) 
 
         # ---------------------------------
         # EXIT

@@ -5,8 +5,8 @@ import re
 from bs4 import BeautifulSoup
 from datetime import datetime
 from core.logger import setup_logger
-from core.utils.price_parser import parse_price
 from core.Web.product_schema import create_product_schema
+from core.utils.price_cleaner import clean_price_tunisianet
 
 logger = setup_logger("spacenet", "scraper")
 
@@ -77,18 +77,18 @@ def parse_spacenet_product_page(html, url, site_name, product_id=None):
             if current_price_div:
                 discount_price_span = current_price_div.find("span", {"content": True})
                 if discount_price_span:
-                    product["discount_price"] = parse_price(discount_price_span.text)
+                    product["discount_price"] = clean_price_tunisianet(discount_price_span.text)
                 
                 discount_amount_span = current_price_div.find("span", {"class": "discount discount-amount"})
                 if discount_amount_span:
-                    product["discount_amount"] = parse_price(discount_amount_span.text)
+                    product["discount_amount"] = clean_price_tunisianet(discount_amount_span.text)
             
             # Original/regular price
             regular_price_div = price_block.find("div", {"class": "product-discount"})
             if regular_price_div:
                 regular_price_span = regular_price_div.find("span", {"class": "regular-price"})
                 if regular_price_span:
-                    product["price"] = parse_price(regular_price_span.text)
+                    product["price"] = clean_price_tunisianet(regular_price_span.text)
         
         else:
             # No discount, fallback to JSON script price
