@@ -152,22 +152,43 @@ def register_all_sites():
     except Exception as e:
         logger.error(f"Error registering megapc: {e}")
     
-    # Future sites - uncomment when ready
-    # try:
-    #     from monitoring.workers.tunisianet_worker import tunisianet_worker
-    #     
-    #     register_site("tunisianet", tunisianet_worker, {
-    #         "workers": 15,
-    #         "interval": 600,
-    #         "enabled": False,  # Disabled until ready
-    #         "timeout": 45,
-    #         "retries": 4,
-    #         "requests_per_minute": 10,
-    #         "use_referer": True,
-    #         "verify_ssl": True
-    #     })
-    # except ImportError as e:
-    #     logger.debug(f"Tunisianet worker not available: {e}")
+    # Import Tunisianet worker
+    try:
+        from monitoring.workers.tunisianet_worker import tunisianet_worker
+
+        register_site("tunisianet", tunisianet_worker, {
+            "workers": 15,
+            "interval": 600,
+            "enabled": True,
+            "timeout": 45,
+            "retries": 4,
+            "requests_per_minute": 10,
+            "use_referer": True,
+            "verify_ssl": True
+        })
+    except ImportError as e:
+        logger.warning(f"Could not import tunisianet_worker: {e}")
+    except Exception as e:
+        logger.error(f"Error registering tunisianet: {e}")
+
+    # Import SBS worker
+    try:
+        from monitoring.workers.sbs_worker import sbs_worker
+
+        register_site("sbs", sbs_worker, {
+            "workers": 15,
+            "interval": 600,
+            "enabled": True,
+            "timeout": 45,
+            "retries": 4,
+            "requests_per_minute": 20,
+            "use_referer": True,
+            "verify_ssl": True
+        })
+    except ImportError as e:
+        logger.warning(f"Could not import sbs_worker: {e}")
+    except Exception as e:
+        logger.error(f"Error registering sbs: {e}")
     
     # try:
     #     from monitoring.workers.mytek_worker import mytek_worker

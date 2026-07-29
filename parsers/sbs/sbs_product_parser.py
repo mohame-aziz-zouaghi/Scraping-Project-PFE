@@ -3,6 +3,7 @@ from bs4 import BeautifulSoup
 from datetime import datetime
 from core.logger import setup_logger
 from core.Web.product_schema import create_product_schema
+from core.utils.price_cleaner import clean_price_generic
 
 logger = setup_logger(site_name="sbs", log_type="scraper")
 
@@ -134,7 +135,7 @@ def parse_sbs_product_page(html, url, site, main_product_id=None):
     # ---------------------------------
 
     # original price from JSON
-    original_price = clean_price(product.get("price"))
+    original_price = clean_price_generic(product.get("price"))
 
     discount_block = soup.select_one(".product-price.has-discount")
 
@@ -142,7 +143,7 @@ def parse_sbs_product_page(html, url, site, main_product_id=None):
 
         # discounted price from HTML
         discounted_el = soup.select_one(".product-discount .regular-price")
-        discounted_price = clean_price(discounted_el.text if discounted_el else None)
+        discounted_price = clean_price_generic(discounted_el.text if discounted_el else None)
 
 
         if discounted_price:

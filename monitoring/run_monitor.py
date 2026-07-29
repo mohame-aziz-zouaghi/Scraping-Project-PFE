@@ -20,21 +20,24 @@ from monitoring.engine.site_registry import (
     SITE_WORKERS, SITE_CONFIGS
 )
 from monitoring.controller import MonitorController, get_controller
+from monitoring.engine.multi_progress import get_multi_progress
 from core.logger import setup_logger
 
 logger = setup_logger("run_monitor", "monitor")
 
 
-# Update the run_interactive_mode function
-
 def run_interactive_mode():
-    """Run monitoring with interactive console - CLEAN OUTPUT"""
+    """Run monitoring with interactive console - Multi-Progress Dashboard"""
     
-    print("\n" + "="*50)
-    print("🤖 MONITORING SYSTEM")
-    print("="*50)
-    print(f"Started: {datetime.now().strftime('%H:%M:%S')}")
-    print("="*50)
+    print("\n" + "="*60)
+    print("🤖 MONITORING SYSTEM - MULTI-SITE DASHBOARD")
+    print("="*60)
+    print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("="*60)
+    print("")
+    print("📊 All sites will be displayed in the dashboard below")
+    print("   Type 'help' for commands | Press Ctrl+C to stop all")
+    print("")
     
     register_all_sites()
     
@@ -46,14 +49,18 @@ def run_interactive_mode():
     print("\n🚀 Starting enabled sites...")
     enabled_sites = get_enabled_sites()
     
+    # Start multi-progress
+    multi_progress = get_multi_progress()
+    multi_progress.start()
+    
     for site in enabled_sites:
         controller.start_monitor(site)
     
-    print("\n" + "="*50)
-    print("🟢 SYSTEM READY")
+    print("\n" + "="*60)
+    print("🟢 SYSTEM READY - Dashboard Active")
     print("   Type 'help' for commands")
     print("   Press Ctrl+C to stop all")
-    print("="*50)
+    print("="*60)
     
     try:
         while True:
@@ -61,6 +68,8 @@ def run_interactive_mode():
     except KeyboardInterrupt:
         print("\n\n🛑 Shutting down...")
         controller.stop_all()
+        multi_progress.stop()
+        multi_progress.close()
         print("✅ System stopped")
 
 
@@ -74,16 +83,22 @@ def run_headless_mode():
     print("Press Ctrl+C to stop")
     print("="*70)
     
-    # Register all sites
     register_all_sites()
     
-    # Run all enabled sites
     engine = MonitorEngine()
-    engine.run_all()
+    
+    try:
+        engine.run_all()
+    except KeyboardInterrupt:
+        print("\n\n🛑 Shutting down...")
+        multi_progress = get_multi_progress()
+        multi_progress.stop()
+        multi_progress.close()
+        print("✅ System stopped")
 
 
 def run_single_site_mode(site: str, workers: int = None, interval: int = None):
-    """Run monitoring for a single site"""
+    """Run monitoring for a single site with multi-progress"""
     
     register_all_sites()
     
@@ -105,7 +120,15 @@ def run_single_site_mode(site: str, workers: int = None, interval: int = None):
     print("="*70 + "\n")
     
     engine = MonitorEngine()
-    engine.run_site(site)
+    
+    try:
+        engine.run_site(site)
+    except KeyboardInterrupt:
+        print("\n\n🛑 Shutting down...")
+        multi_progress = get_multi_progress()
+        multi_progress.stop()
+        multi_progress.close()
+        print("✅ System stopped")
 
 
 def enable_site(site: str):

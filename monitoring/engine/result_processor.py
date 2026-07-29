@@ -53,6 +53,62 @@ class ResultProcessor:
             return str(value).strip() if value else None
         
         return value
+    
+    def _resolve_price_valid_until(self, new_date: Optional[str], old_date: Optional[str]) -> str:
+        """
+        Resolve price_valid_until with smart logic.
+        
+        Logic:
+        1. If site provides a date:
+           - ALWAYS use it AS-IS (trust the site completely)
+           - NO modification, NO expiration checking
+        2. If site does NOT provide a date:
+           - Use cached date if it exists and is NOT expired → KEEP IT
+           - Use cached date if it's expired → EXTEND BY 3 DAYS
+           - If no cached date → SET TO 3 DAYS FROM NOW
+        
+        Why? Some sites (like MegaPC) have static dates from years ago.
+        We should NEVER modify dates that the site provides.
+        Only generate dates for sites that don't provide them.
+        """
+        today = datetime.now().date()
+        
+        # =============================================
+        # CASE 1: Site provides a date (TRUST THE SITE COMPLETELY)
+        # =============================================
+        if new_date:
+            logger.debug(f"DATE_RESOLVE | USING_SITE_DATE | {new_date} | trusted")
+            return new_date
+        
+        # =============================================
+        # CASE 2: Site does NOT provide a date
+        # =============================================
+        if old_date:
+            try:
+                date_obj = datetime.strptime(old_date, "%Y-%m-%d").date()
+                
+                # If cached date is still valid (today or future), KEEP IT
+                if date_obj >= today:
+                    logger.debug(f"DATE_RESOLVE | KEEP_CACHED | {old_date} | valid")
+                    return old_date
+                
+                # Cached date is expired, EXTEND BY 3 DAYS
+                if date_obj < today:
+                    extended = (date_obj + timedelta(days=3)).strftime("%Y-%m-%d")
+                    logger.debug(f"DATE_RESOLVE | EXTENDED_EXPIRED_CACHED | {old_date} -> {extended}")
+                    return extended
+                    
+            except ValueError as e:
+                # Invalid cached date
+                logger.warning(f"DATE_RESOLVE | INVALID_CACHED_DATE | {old_date} | {e}")
+                # Fall through to CASE 3
+        
+        # =============================================
+        # CASE 3: No valid date anywhere
+        # =============================================
+        default_date = (datetime.now() + timedelta(days=3)).strftime("%Y-%m-%d")
+        logger.debug(f"DATE_RESOLVE | DEFAULT | {default_date}")
+        return default_date
 
     def _log_change_details(self, site: str, product_id: str, old_value, new_value, field: str):
         """Log detailed field change"""
@@ -81,6 +137,17 @@ class ResultProcessor:
             # Validate old_data
             if old_data is not None and not isinstance(old_data, dict):
                 old_data = None
+            
+            # =====================================================
+            # RESOLVE PRICE_VALID_UNTIL (with old data context)
+            # =====================================================
+            if new_data:
+                raw_new_date = new_data.get("price_valid_until")
+                old_date = old_data.get("price_valid_until") if old_data else None
+                
+                # Resolve the final date using the processor logic
+                resolved_date = self._resolve_price_valid_until(raw_new_date, old_date)
+                new_data["price_valid_until"] = resolved_date
             
             # First time seeing this product
             if not old_data:
@@ -134,13 +201,6 @@ class ResultProcessor:
             
             # Update last_checked timestamp
             self.cache.update_last_checked(site, main_product_id)
-            
-            # If price changed, update price volatility in Redis
-            if is_price_change:
-                new_price = float(new_data.get("price", 0))
-                # Note: price volatility is now stored in PostgreSQL only
-                # Redis only stores the current price
-                pass
             
             logger.info(f"{site} | REDIS_UPDATED | {main_product_id}")
             
