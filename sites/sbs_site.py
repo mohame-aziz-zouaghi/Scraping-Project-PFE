@@ -36,7 +36,13 @@ class SBSSite(BaseSite):
     name = "SBS"
     SEARCH_URL = "https://www.sbsinformatique.com/recherche?controller=search&s={query}&page={page}"
 
+    # sites/sbs.py
+
     def __init__(self, workers=10):
+        # IMPORTANT: Call super().__init__() FIRST to initialize base class attributes
+        super().__init__()
+        
+        self.name = "SBS"
         self.lock = threading.Lock()
         self.workers = workers
 
@@ -44,15 +50,15 @@ class SBSSite(BaseSite):
         self.cache = None
         self.db = None
 
-        # Stats tracking
-        self.stats = {
+        # Stats tracking - update base class stats
+        self.stats.update({
             "new_products": 0,
             "skipped_duplicates": 0,
             "errors": 0,
             "redis_saved": 0,
             "postgres_saved": 0,
             "total_products_found": 0
-        }
+        })
 
     # ---------------------------------
     # CONNECTION MANAGEMENT
@@ -305,100 +311,61 @@ class SBSSite(BaseSite):
     # ---------------------------------
     # CATEGORY SCRAPER
     # ---------------------------------
+    # sites/sbs.py - Updated scrape_category (remove tqdm)
+
     def scrape_category(self, category_name, category_url, seen_products):
-
         results = []
-
+        
         logger.info(f"{self.name} | CATEGORY_START | {category_name}")
-
+        
+        self.stats['current_category'] = category_name
+        if hasattr(self, '_update_stats'):
+            self._update_stats(self.stats)
+        
         first_page = self.safe_get(category_url)
         if not first_page:
             error_logger.error(f"{self.name} | CATEGORY_FAIL | {category_name}")
             return results
-
+        
         total_pages = self.get_category_page_count(first_page)
-
-        logger.info(
-            f"{self.name} | CATEGORY_INFO | {category_name} | pages={total_pages}"
-        )
-
-        page_bar = tqdm(
-            total=total_pages,
-            desc=f"{self.name} | {category_name}",
-            unit="page"
-        )
-
+        logger.info(f"{self.name} | CATEGORY_INFO | {category_name} | pages={total_pages}")
+        
         for page in range(1, total_pages + 1):
-
             url = self.build_category_url(category_url, page)
-
-            logger.info(
-                f"{self.name} | PAGE_FETCH | {category_name} | {page}/{total_pages}"
-            )
-
+            
+            self.stats['current_product'] = f"Page {page}/{total_pages}"
+            if hasattr(self, '_update_stats'):
+                self._update_stats(self.stats)
+            
             html = self.safe_get(url)
-
             if not html:
-                error_logger.warning(
-                    f"{self.name} | PAGE_FAIL | {category_name} | page={page}"
-                )
-                page_bar.update(1)
+                error_logger.warning(f"{self.name} | PAGE_FAIL | {category_name} | page={page}")
                 continue
-
+            
             try:
                 products = parse_products(html, self.name)
             except Exception as e:
-                error_logger.error(
-                    f"{self.name} | PARSE_CATEGORY_ERROR | page={page} | {e}"
-                )
-                page_bar.update(1)
+                error_logger.error(f"{self.name} | PARSE_CATEGORY_ERROR | page={page} | {e}")
                 continue
-
+            
             if not products:
-                logger.info(
-                    f"{self.name} | NO_PRODUCTS | {category_name} | page={page}"
-                )
-                page_bar.update(1)
                 continue
-
-            # ---------------------------------
-            # WORKERS WITH PROGRESS
-            # ---------------------------------
+            
             with ThreadPoolExecutor(max_workers=self.workers) as executor:
-
                 futures = [
-                    executor.submit(
-                        self.scrape_product_worker,
-                        p,
-                        seen_products,
-                        category_name
-                    )
+                    executor.submit(self.scrape_product_worker, p, seen_products, category_name)
                     for p in products
                 ]
-
-                for future in tqdm(
-                    as_completed(futures),
-                    total=len(futures),
-                    desc=f"{category_name} | page {page}",
-                    leave=False
-                ):
+                
+                for future in as_completed(futures):
                     try:
                         result = future.result()
                         if result:
                             results.append(result)
                     except Exception as e:
-                        error_logger.error(
-                            f"{self.name} | WORKER_ERROR | {category_name} | {e}"
-                        )
-
-            page_bar.update(1)
-
-        page_bar.close()
-
-        logger.info(
-            f"{self.name} | CATEGORY_DONE | {category_name} | collected={len(results)}"
-        )
-
+                        error_logger.error(f"{self.name} | WORKER_ERROR | {category_name} | {e}")
+        
+        logger.info(f"{self.name} | CATEGORY_DONE | {category_name} | collected={len(results)}")
         return results
 
     # ---------------------------------
@@ -483,19 +450,28 @@ class SBSSite(BaseSite):
     # ---------------------------------
     # MAIN SCRAPER
     # ---------------------------------
-    def scrape_site(self):
+    # sites/sbs.py - scrape_site method
 
+    def scrape_site(self):
         logger.info(f"{self.name} | SCRAPE_START")
         log_global(f"{self.name} | SCRAPE_START")
 
         # Reset stats for this run
+        total_categories = len(CATEGORIES)
         self.stats = {
             "new_products": 0,
             "skipped_duplicates": 0,
             "errors": 0,
             "redis_saved": 0,
             "postgres_saved": 0,
-            "total_products_found": 0
+            "total_products_found": 0,
+            "completed_categories": 0,
+            "total_categories": total_categories,
+            "current_category": "",
+            "current_product": "",
+            "current_page": 0,
+            "total_pages": 0,
+            "category_progress": 0
         }
 
         results = []
@@ -515,20 +491,26 @@ class SBSSite(BaseSite):
             }
 
         try:
-            category_bar = tqdm(
-                total=len(CATEGORIES),
-                desc="SBS | Categories"
-            )
-
-            for name, url in CATEGORIES.items():
-
-                results.extend(
-                    self.scrape_category(name, url, seen_products)
-                )
-
-                category_bar.update(1)
-
-            category_bar.close()
+            # Initial stats update
+            if hasattr(self, '_update_stats'):
+                self._update_stats(self.stats)
+            
+            # Process categories
+            for i, (name, url) in enumerate(CATEGORIES.items(), start=1):
+                # Update current category
+                self.stats['current_category'] = name
+                if hasattr(self, '_update_stats'):
+                    self._update_stats(self.stats)
+                
+                # Scrape category
+                results.extend(self.scrape_category(name, url, seen_products))
+                
+                # Complete category
+                self.stats['completed_categories'] = i
+                if hasattr(self, '_update_stats'):
+                    self._update_stats(self.stats)
+                
+                logger.info(f"Progress: {i}/{total_categories} categories completed")
 
             # BRAND FALLBACK
             results.extend(self.scrape_brands(seen_products))
@@ -540,10 +522,14 @@ class SBSSite(BaseSite):
 
         total = len(results)
         self.stats["total_products_found"] = total
+        self.stats['completed_categories'] = total_categories
+        if hasattr(self, '_update_stats'):
+            self._update_stats(self.stats)
 
         logger.info(f"{self.name} | SCRAPE_DONE | total={total}")
         log_global(f"{self.name} | SCRAPE_DONE | total={total}")
 
+        # Print summary
         print("\n==============================")
         print(f"SITE: {self.name}")
         print(f"TOTAL PRODUCTS: {total}")

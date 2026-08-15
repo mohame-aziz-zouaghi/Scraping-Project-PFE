@@ -2,6 +2,7 @@
 from datetime import datetime, timedelta
 import json
 import re
+from typing import Dict, Any, Optional, List, Tuple
 from bs4 import BeautifulSoup
 from core.logger import setup_logger
 from core.Web.product_schema import create_product_schema
@@ -31,27 +32,6 @@ def extract_prices_from_json(
     discount_field: str = "price",
     reduction_field: str = "reduction"
 ) -> dict:
-    """
-    Extract prices from Tunisianet JSON data with automatic rounding.
-    
-    Args:
-        data: Product data dictionary
-        decimals: Number of decimal places (default: 2)
-        price_field: Field name for original price
-        discount_field: Field name for current price
-        reduction_field: Field name for reduction amount
-    
-    Returns:
-        Dictionary with price, discount_price, discount_amount, has_discount
-    
-    Examples:
-        extract_prices_from_json({
-            "price_without_reduction": "2 715,000 DT",
-            "price": "1 099,000 DT",
-            "reduction": "120,000 DT"
-        })
-        → {"price": 2715.0, "discount_price": 1099.0, "discount_amount": 120.0, "has_discount": True}
-    """
     result = {
         "price": 0.0,
         "discount_price": 0.0,
@@ -59,17 +39,14 @@ def extract_prices_from_json(
         "has_discount": False
     }
     
-    # Get price without reduction (original price)
     price_without_reduction = data.get(price_field)
     if price_without_reduction:
         result["price"] = clean_price_tunisianet(price_without_reduction, decimals) or 0.0
     else:
-        # Try from price_amount
         price_amount = data.get("price_amount")
         if price_amount:
             result["price"] = round(float(price_amount), decimals)
     
-    # Get current price
     current_price = data.get(discount_field)
     if current_price:
         result["discount_price"] = clean_price_tunisianet(current_price, decimals) or 0.0
@@ -78,25 +55,20 @@ def extract_prices_from_json(
         if price_amount:
             result["discount_price"] = round(float(price_amount), decimals)
     
-    # ONLY CHECK FOR DISCOUNT IF REDUCTION EXISTS
     reduction = data.get(reduction_field)
     if reduction:
-        # Product has discount - extract reduction amount
         result["discount_amount"] = clean_price_tunisianet(reduction, decimals) or 0.0
         result["has_discount"] = True
         
-        # If discount_price is not set correctly, calculate it
         if result["price"] > 0 and result["discount_amount"] > 0:
             result["discount_price"] = round(result["price"] - result["discount_amount"], decimals)
         elif result["discount_price"] == 0 and result["price"] > 0:
             result["discount_price"] = round(result["price"] - result["discount_amount"], decimals)
     else:
-        # NO DISCOUNT - reset discount fields to 0
         result["discount_price"] = 0.0
         result["discount_amount"] = 0.0
         result["has_discount"] = False
     
-    # Round final prices
     if decimals == 0:
         result["price"] = int(round(result["price"]))
         result["discount_price"] = int(round(result["discount_price"]))
@@ -106,7 +78,6 @@ def extract_prices_from_json(
         result["discount_price"] = round(result["discount_price"], decimals)
         result["discount_amount"] = round(result["discount_amount"], decimals)
     
-    # Validate prices
     if not validate_price(result["price"]):
         result["price"] = 0.0
     
@@ -117,9 +88,6 @@ def extract_prices_from_json(
 
 
 def extract_prices_from_html(soup: BeautifulSoup) -> dict:
-    """
-    Extract prices from HTML when JSON is not available
-    """
     result = {
         "price": 0.0,
         "discount_price": 0.0,
@@ -127,48 +95,38 @@ def extract_prices_from_html(soup: BeautifulSoup) -> dict:
         "has_discount": False
     }
     
-    # Find product-prices container
     prices_container = soup.select_one(".product-prices")
     if not prices_container:
         return result
     
-    # Check for discount section (regular price)
     regular_price_element = prices_container.select_one(".regular-price")
     if regular_price_element:
-        # Product has discount - get regular price
         regular_price_text = regular_price_element.text.strip()
         result["price"] = clean_price_tunisianet(regular_price_text)
         result["has_discount"] = True
         
-        # Get discount amount from discount element
         discount_amount_element = prices_container.select_one(".discount-amount")
         if discount_amount_element:
             discount_text = discount_amount_element.text.strip()
-            # Extract number from "Économisez 120,000 DT"
             match = re.search(r'(\d+[\.,]?\d*)', discount_text)
             if match:
                 result["discount_amount"] = clean_price_tunisianet(match.group(1))
     
-    # Get current price
     current_price_element = prices_container.select_one(".current-price .price, .current-price span[itemprop='price']")
     if current_price_element:
         current_price_text = current_price_element.text.strip()
-        # Remove "TTC" if present
         current_price_text = current_price_text.replace("TTC", "").strip()
         result["discount_price"] = clean_price_tunisianet(current_price_text)
     
-    # If no discount detected, use current price as regular price
     if not result["has_discount"] and result["discount_price"]:
         result["price"] = result["discount_price"]
         result["discount_price"] = 0.0
         result["discount_amount"] = 0.0
     
-    # Calculate discount amount if we have discount but no discount_amount
     if result["has_discount"] and result["price"] > 0 and result["discount_price"] > 0:
         if result["discount_amount"] == 0:
             result["discount_amount"] = round(result["price"] - result["discount_price"], 2)
     
-    # Validate
     if not validate_price(result["price"]):
         result["price"] = 0.0
     
@@ -176,24 +134,17 @@ def extract_prices_from_html(soup: BeautifulSoup) -> dict:
 
 
 def parse_prices(data: dict, soup: BeautifulSoup) -> dict:
-    """
-    Main price parsing function - prioritizes JSON, falls back to HTML
-    """
     prices = {}
     
-    # Try JSON first
     if data:
         json_prices = extract_prices_from_json(data)
-        # If JSON has valid price, use it
         if json_prices["price"] > 0:
             return json_prices
     
-    # Fallback to HTML
     html_prices = extract_prices_from_html(soup)
     if html_prices["price"] > 0:
         return html_prices
     
-    # If all else fails, try to find any price
     price_element = soup.select_one("[itemprop='price']")
     if price_element:
         price_text = price_element.get("content") or price_element.text.strip()
@@ -218,7 +169,6 @@ def parse_prices(data: dict, soup: BeautifulSoup) -> dict:
 # =====================================================
 
 def extract_text_from_html(html_content):
-    """Extract clean text from HTML content"""
     if not html_content:
         return ""
     try:
@@ -229,7 +179,6 @@ def extract_text_from_html(html_content):
 
 
 def parse_features_to_short_description(features: list) -> list:
-    """Convert product features to short_description list format"""
     short_description = []
     
     if not features:
@@ -248,8 +197,7 @@ def parse_features_to_short_description(features: list) -> list:
     return short_description
 
 
-def extract_images_from_data(data: dict) -> tuple:
-    """Extract images from product data"""
+def extract_images_from_data(data: dict) -> Tuple[List[str], Optional[str]]:
     images_list = []
     main_image = None
     
@@ -290,37 +238,41 @@ def extract_images_from_data(data: dict) -> tuple:
 
 
 # =====================================================
-# MAIN PARSER
+# MAIN PARSER - RETURNS Dict OR None
 # =====================================================
 
-def parse_tunisianet_product_page(html, url, site, main_product_id=None):
-    """Parse Tunisianet (Spacenet) product page HTML"""
+def parse_tunisianet_product_page(html: str, url: str, site: str, main_product_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Parse Tunisianet product page HTML - returns None if invalid"""
+    
     if not html:
-        logger.error("Empty HTML provided")
+        logger.error(f"{site} | EMPTY_HTML | {url}")
         return None
     
-    soup = BeautifulSoup(html, "lxml")
+    try:
+        soup = BeautifulSoup(html, "lxml")
+    except Exception as e:
+        logger.error(f"{site} | BEAUTIFULSOUP_ERROR | {url} | {e}")
+        return None
 
-    # =====================================================
-    # EXTRACT PRODUCT JSON
-    # =====================================================
     product_div = soup.select_one("#product-details")
-    data = {}
+    if not product_div:
+        logger.warning(f"{site} | NO_PRODUCT_DETAILS | {url}")
+        return None
 
+    # Extract JSON
+    data = {}
     if product_div and product_div.has_attr("data-product"):
         try:
             raw_data = product_div["data-product"]
             raw_data = clean_json_string(raw_data)
             data = json.loads(raw_data)
-            logger.debug(f"JSON data extracted successfully")
+            logger.debug(f"{site} | JSON_EXTRACTED | {url}")
         except json.JSONDecodeError as e:
             logger.warning(f"{site} | JSON_PARSE_ERROR | {e}")
         except Exception as e:
             logger.warning(f"{site} | JSON_EXTRACT_ERROR | {e}")
 
-    # =====================================================
-    # EXTRACT PRODUCT ID
-    # =====================================================
+    # Extract product ID
     if not main_product_id:
         main_product_id = data.get("id") or data.get("id_product")
     
@@ -328,16 +280,14 @@ def parse_tunisianet_product_page(html, url, site, main_product_id=None):
         url_match = re.search(r'/(\d+)-', url)
         if url_match:
             main_product_id = url_match.group(1)
+    
+    if not main_product_id:
+        logger.warning(f"{site} | NO_PRODUCT_ID | {url}")
+        return None
 
-    # =====================================================
-    # INIT PRODUCT SCHEMA
-    # =====================================================
+    # Initialize product
     product = create_product_schema(site, url, main_product_id)
 
-    # =====================================================
-    # BASIC DATA
-    # =====================================================
-    
     # Name
     raw_name = data.get("name", "")
     product["name"] = clean_product_name(raw_name)
@@ -346,6 +296,10 @@ def parse_tunisianet_product_page(html, url, site, main_product_id=None):
         title_tag = soup.select_one("h1.product-name")
         if title_tag:
             product["name"] = clean_product_name(title_tag.text.strip())
+    
+    if not product["name"]:
+        logger.warning(f"{site} | NO_PRODUCT_NAME | {url}")
+        return None
     
     # Brand
     manufacturer_name = data.get("manufacturer_name")
@@ -375,17 +329,14 @@ def parse_tunisianet_product_page(html, url, site, main_product_id=None):
                     product["category"] = clean_category_name(cat_text)
                     break
     
-    # Special ID (Reference/SKU)
+    # Special ID
     raw_special_id = data.get("reference", "")
     product["special_id"] = clean_special_id(raw_special_id)
     
     if not product["special_id"] and main_product_id:
         product["special_id"] = clean_special_id(str(main_product_id))
 
-    # =====================================================
-    # PRICES (SITE-SPECIFIC EXTRACTION)
-    # =====================================================
-    
+    # Prices
     prices = parse_prices(data, soup)
     
     product["price"] = prices.get("price", 0.0)
@@ -393,10 +344,11 @@ def parse_tunisianet_product_page(html, url, site, main_product_id=None):
     product["discount_amount"] = prices.get("discount_amount", 0.0)
     product["has_discount"] = prices.get("has_discount", False)
 
-    # =====================================================
-    # DESCRIPTION
-    # =====================================================
-    
+    if product["price"] <= 0:
+        logger.warning(f"{site} | NO_PRICE | {url} | price={product['price']}")
+        return None
+
+    # Description
     short_desc_html = data.get("description_short")
     if short_desc_html:
         try:
@@ -414,10 +366,7 @@ def parse_tunisianet_product_page(html, url, site, main_product_id=None):
             except:
                 product["description"] = ""
 
-    # =====================================================
-    # FEATURES → SHORT DESCRIPTION LIST
-    # =====================================================
-    
+    # Features
     features = data.get("features", [])
     product["short_description"] = parse_features_to_short_description(features)
 
@@ -433,10 +382,7 @@ def parse_tunisianet_product_page(html, url, site, main_product_id=None):
                     if name and value and not is_empty_or_placeholder(name) and not is_empty_or_placeholder(value):
                         product["short_description"].append(f"{name}: {value}")
 
-    # =====================================================
-    # IMAGES
-    # =====================================================
-    
+    # Images
     images_list, main_image = extract_images_from_data(data)
     product["images"] = images_list
     product["main_image"] = main_image
@@ -453,10 +399,7 @@ def parse_tunisianet_product_page(html, url, site, main_product_id=None):
                 if not product["main_image"]:
                     product["main_image"] = src
 
-    # =====================================================
-    # AVAILABILITY (NORMALIZED)
-    # =====================================================
-    
+    # Availability
     availability_text = None
     
     if data.get("availability_message"):
@@ -476,10 +419,7 @@ def parse_tunisianet_product_page(html, url, site, main_product_id=None):
     
     product["availability"] = normalize_availability(availability_text)
 
-    # =====================================================
-    # PRICE VALID UNTIL
-    # =====================================================
-    
+    # Price valid until
     price_valid_until = data.get("price_valid_until") or data.get("valid_until")
     
     if price_valid_until:
@@ -489,10 +429,7 @@ def parse_tunisianet_product_page(html, url, site, main_product_id=None):
         product["price_valid_until"] = default_valid_until
         logger.debug(f"{site} | PRICE_VALID_UNTIL_DEFAULT_SET | {default_valid_until}")
 
-    # =====================================================
-    # ADDITIONAL METADATA
-    # =====================================================
-    
+    # Additional metadata
     product["reference"] = data.get("reference")
     product["ean"] = data.get("ean13")
     product["upc"] = data.get("upc")
@@ -505,10 +442,10 @@ def parse_tunisianet_product_page(html, url, site, main_product_id=None):
         except:
             pass
 
-    # =====================================================
-    # LOG SUCCESS
-    # =====================================================
-    
+    # Ensure URL
+    if not product.get("url"):
+        product["url"] = url
+
     logger.debug(f"{site} | PRODUCT_PARSED | {product['name'][:50]}..." if product['name'] else f"{site} | PRODUCT_PARSED | {main_product_id}")
     
     return product
@@ -518,7 +455,7 @@ def parse_tunisianet_product_page(html, url, site, main_product_id=None):
 # FAST CHECK FOR MONITORING
 # =====================================================
 
-def fast_check_tunisianet_product(url: str, product_id: str = None):
+def fast_check_tunisianet_product(url: str, product_id: str = None) -> Optional[Dict[str, Any]]:
     """Quick check function for Tunisianet products."""
     from core.Web.http_client import get
     

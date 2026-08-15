@@ -15,6 +15,7 @@ from datetime import datetime
 
 from Database.Postgresql.db import Database
 from core.logger import setup_logger
+from core.shutdown_handler import register_flush_hook
 
 logger = setup_logger("batch_processor", "monitor")
 
@@ -61,6 +62,8 @@ class AdaptiveBatchProcessor:
         # Start background timer
         self._start_timer()
         logger.info(f"✅ SmartBatchProcessor started (site_batch=50, site_interval=60s, global_interval=120s)")
+        # Register flush hook for shutdown
+        register_flush_hook(self.flush_all, "BatchProcessor")
     
     # =====================================================
     # CORE METHODS

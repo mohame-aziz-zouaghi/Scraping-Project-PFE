@@ -1,4 +1,4 @@
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from tqdm import tqdm
 from bs4 import BeautifulSoup
@@ -223,61 +223,54 @@ class MytekSite(BaseSite):
     # ---------------------------------
     
 
+    # sites/mytek.py - Updated scrape_category
+
     def scrape_category(self, category_name, category_url, seen_products, existing_ids):
-
         logger.info(f"{self.name} | CATEGORY_START | {category_name}")
-
+        
+        # Update stats for dashboard
+        self.stats['current_category'] = category_name
+        
         results = []
         seen_ids = set()
-
+        
         first_html = get(category_url)
         if not first_html:
             return results
-
+        
         total_pages = self.get_category_page_count(first_html)
-
-        # ---------------------------------
-        # PAGE PROGRESS BAR (CATEGORY LEVEL)
-        # ---------------------------------
-        for page in tqdm(
-            range(1, total_pages + 1),
-            desc=f"{self.name} | {category_name} | Pages",
-            unit="page",
-            leave=False
-        ):
-
+        
+        for page in range(1, total_pages + 1):
             html = get(f"{category_url}?p={page}")
-
+            
+            # Update stats for dashboard
+            self.stats['current_product'] = f"Page {page}/{total_pages}"
+            if hasattr(self, '_update_stats'):
+                self._update_stats(self.stats)
+            
             if not html:
                 continue
-
+            
             products = parse_mytek_products(html, self.name)
-
             if not products:
                 continue
-
-            # avoid loop fallback
+            
             first_id = products[0].get("main_product_id")
             if first_id in seen_ids:
                 break
-
+            
             for p in products:
                 seen_ids.add(p.get("main_product_id"))
-
-            # filter cache
+            
             filtered = [
                 p for p in products
                 if str(p.get("main_product_id")) not in existing_ids
             ]
-
+            
             if not filtered:
                 continue
-
-            # ---------------------------------
-            # PRODUCT PROGRESS BAR (THREADS)
-            # ---------------------------------
+            
             with ThreadPoolExecutor(max_workers=20) as executor:
-
                 futures = [
                     executor.submit(
                         self.scrape_product_worker,
@@ -288,30 +281,18 @@ class MytekSite(BaseSite):
                     )
                     for p in filtered
                 ]
-
-                for future in tqdm(
-                    futures,
-                    desc=f"{self.name} | Products",
-                    total=len(futures),
-                    leave=False,
-                    unit="prod"
-                ):
+                
+                for future in as_completed(futures):
                     result = future.result()
-
                     if result:
                         results.append(result)
                         self.performance.add_product()
-
-            # ---------------------------------
-            # LOGGING
-            # ---------------------------------
-            speed = self.performance.get_speed()
-
-            log_global(
-                f"{self.name} | {category_name} | page {page}/{total_pages} | "
-                f"speed={speed:.2f} prod/s | total={self.performance.total_products}"
-            )
-
+            
+            # Update category progress
+            self.stats['completed_categories'] = page
+            if hasattr(self, '_update_stats'):
+                self._update_stats(self.stats)
+        
         return results
 
     # ---------------------------------
@@ -363,32 +344,66 @@ class MytekSite(BaseSite):
     # ---------------------------------
     # FULL SCRAPER
     # ---------------------------------
-    def scrape_site(self):
+    # sites/mytek.py - scrape_site method
 
+    def scrape_site(self):
         logger.info(f"{self.name} | SCRAPE_START")
         log_global(f"{self.name} | SCRAPE_START")
 
         self.start_time = time.time()
-
         results = []
         seen_products = {}
-
         existing_ids = load_existing_product_ids(self.name)
-# 
-        logger.info(
-            f"{self.name} | RESUME_MODE | existing={len(existing_ids)}"
-        )
+        
+        total_categories = len(CATEGORIES)
+        self.stats = {
+            "new_products": 0,
+            "skipped_duplicates": 0,
+            "errors": 0,
+            "redis_saved": 0,
+            "postgres_saved": 0,
+            "total_products_found": 0,
+            "completed_categories": 0,
+            "total_categories": total_categories,
+            "current_category": "",
+            "current_product": "",
+            "current_page": 0,
+            "total_pages": 0,
+            "category_progress": 0
+        }
+        
+        logger.info(f"{self.name} | RESUME_MODE | existing={len(existing_ids)}")
+        
+        # Initial stats update
+        if hasattr(self, '_update_stats'):
+            self._update_stats(self.stats)
 
-        for name, url in tqdm(
-            CATEGORIES.items(),
-            desc=f"{self.name} | Categories",
-            unit="cat"
-        ):
+        # Process categories
+        for i, (name, url) in enumerate(CATEGORIES.items(), start=1):
+            # Update current category
+            self.stats['current_category'] = name
+            if hasattr(self, '_update_stats'):
+                self._update_stats(self.stats)
+            
+            # Scrape category
             res = self.scrape_category(name, url, seen_products, existing_ids)
             results.extend(res)
+            
+            # Complete category
+            self.stats['completed_categories'] = i
+            if hasattr(self, '_update_stats'):
+                self._update_stats(self.stats)
+            
+            logger.info(f"Progress: {i}/{total_categories} categories completed")
 
+        # Brand fallback
         brand_results = self.scrape_brands(seen_products, existing_ids)
         results.extend(brand_results)
+
+        # Complete all categories
+        self.stats['completed_categories'] = total_categories
+        if hasattr(self, '_update_stats'):
+            self._update_stats(self.stats)
 
         logger.info(f"{self.name} | SCRAPE_DONE | total={len(results)}")
         log_global(f"{self.name} | SCRAPE_DONE | total={len(results)}")
@@ -403,27 +418,3 @@ class MytekSite(BaseSite):
             "total_products": len(results),
             "products": results
         }
-    
-
-    def get_category_page_count(self, html):
-
-        soup = BeautifulSoup(html, "lxml")
-
-        max_page = 1
-
-        # ---------------------------------
-        # Extract pagination numbers
-        # ---------------------------------
-        for a in soup.select("a.page-link"):
-
-            text = a.get_text(strip=True)
-
-            if text.isdigit():
-                try:
-                    page_num = int(text)
-                    if page_num > max_page:
-                        max_page = page_num
-                except:
-                    continue
-
-        return max_page

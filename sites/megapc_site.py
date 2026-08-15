@@ -39,7 +39,11 @@ class MegaPCSite(BaseSite):
     """MegaPC scraper - ONLY adds NEW products, skips existing ones"""
     
     def __init__(self):
+        # IMPORTANT: Call super().__init__() FIRST to initialize base class attributes
+        super().__init__()
+        
         self.name = "MEGAPC"
+        self.scrape_interval = 1800  # 30 minutes between scrapes
         self.performance = PerformanceTracker()
         
         # API endpoints
@@ -63,14 +67,21 @@ class MegaPCSite(BaseSite):
             delay_between_requests=(0.5, 1.5)
         )
         
-        # Stats tracking
+        # Stats tracking - update base class stats
         self.stats = {
             "new_products": 0,
             "skipped_duplicates": 0,
             "errors": 0,
             "redis_saved": 0,
             "postgres_saved": 0,
-            "total_products_found": 0
+            "total_products_found": 0,
+            "completed_categories": 0,
+            "total_categories": 0,
+            "current_category": "",
+            "current_product": "",
+            "current_page": 0,
+            "total_pages": 0,
+            "category_progress": 0
         }
 
         # Thread safety
@@ -576,11 +587,10 @@ class MegaPCSite(BaseSite):
     def _print_final_stats(self, results: List[Dict]):
         """Print final statistics with formatting"""
         print(f"\n{'='*60}")
-        print("📊 SCRAPE COMPLETE (NEW PRODUCTS ONLY)")
+        print(f"📊 SCRAPE COMPLETE: {self.name}")
         print(f"{'='*60}")
         print(f"✅ New products: {self.stats['new_products']:,}")
         print(f"⏭️  Existing products (skipped): {self.stats['skipped_duplicates']:,}")
-        print(f"⚠️ Duplicates in session: {self.stats['skipped_duplicates']:,}")
         print(f"💾 Redis saves: {self.stats['redis_saved']:,}")
         print(f"🗄️ PostgreSQL saves: {self.stats['postgres_saved']:,}")
         print(f"❌ Errors: {self.stats['errors']:,}")
@@ -621,6 +631,8 @@ class MegaPCSite(BaseSite):
     # MAIN SCRAPE METHOD
     # =====================================================
     
+    # sites/megapc.py - scrape_site method
+
     def scrape_site(self, force_build_refresh: bool = False) -> List[Dict]:
         """
         Main scrape method - ONLY finds and adds NEW products
@@ -636,48 +648,38 @@ class MegaPCSite(BaseSite):
         # STEP 1: VALIDATE BUILD ID
         # =====================================================
         logger.info("Validating MegaPC build ID...")
-        print("\n🔍 Validating MegaPC build ID...")
         
         if force_build_refresh:
             logger.info("Forcing build ID refresh...")
-            print("🔄 Forcing build ID refresh...")
             self.build_manager.invalidate_cache()
         
         build_id = self.build_manager.get_build_id(force_refresh=force_build_refresh)
         
         if not build_id:
             logger.error("Failed to get build ID. Aborting scrape.")
-            print("\n❌ Failed to get build ID. Aborting scrape.")
             return []
         
         if not self._validate_build_id(build_id):
             logger.warning(f"Build ID {build_id} appears invalid. Discovering new one...")
-            print(f"\n⚠️ Build ID {build_id} appears invalid. Discovering new one...")
-            
             self.build_manager.invalidate_cache()
             new_build_id = self.build_manager.get_build_id(force_refresh=True)
             
             if not new_build_id:
                 logger.error("Failed to discover valid build ID. Aborting scrape.")
-                print("\n❌ Failed to discover valid build ID. Aborting scrape.")
                 return []
             
             if not self._validate_build_id(new_build_id):
                 logger.error(f"New build ID {new_build_id} also appears invalid. Aborting scrape.")
-                print(f"\n❌ New build ID {new_build_id} also appears invalid. Aborting scrape.")
                 return []
             
             build_id = new_build_id
             logger.info(f"Valid build ID discovered: {build_id}")
-            print(f"\n✅ Valid build ID discovered: {build_id}")
         else:
             logger.info(f"Build ID validated: {build_id}")
-            print(f"\n✅ Build ID validated: {build_id}")
         
         self.current_build_id = build_id
         self.base_next = f"{self.base_next_url}/{build_id}"
         logger.info(f"Base Next URL: {self.base_next}")
-        print(f"📡 Using build ID: {build_id}")
         
         # =====================================================
         # STEP 2: INITIALIZE CONNECTIONS
@@ -690,65 +692,63 @@ class MegaPCSite(BaseSite):
             self._init_connections()
         except Exception as e:
             logger.error(f"{self.name} | CONNECTION_FAILED | {e}")
-            print(f"\n❌ Failed to connect to database: {e}")
             return []
         
         try:
-            # Reset stats
-            self.stats = {k: 0 for k in self.stats}
+            # Reset stats with total categories
+            self.stats = {
+                "new_products": 0,
+                "skipped_duplicates": 0,
+                "errors": 0,
+                "redis_saved": 0,
+                "postgres_saved": 0,
+                "total_products_found": 0,
+                "completed_categories": 0,
+                "total_categories": total_categories,
+                "current_category": "",
+                "current_product": "",
+                "current_page": 0,
+                "total_pages": 0,
+                "category_progress": 0
+            }
             self.seen_products.clear()
+            
+            # Initial stats update
+            if hasattr(self, '_update_stats'):
+                self._update_stats(self.stats)
             
             # =====================================================
             # STEP 3: PROCESS CATEGORIES
             # =====================================================
             for i, (cat, subs) in enumerate(CATEGORIES.items(), start=1):
                 if self.test_mode and i > 1:
-                    print(f"\n⏹️ Test mode: stopping after first category")
                     break
                 
                 self.performance.add_category()
                 
-                print(f"\n{'='*60}")
-                print(f"📦 CATEGORY {i}/{total_categories}: {cat}")
-                print(f"{'='*60}")
-                
-                show_sub_progress = len(subs) > 1
-                if show_sub_progress:
-                    sub_progress = ProgressBar(
-                        total=len(subs),
-                        width=30,
-                        prefix=f"   Subcategories",
-                        show_eta=False
-                    )
+                # Update current category
+                self.stats['current_category'] = cat
+                if hasattr(self, '_update_stats'):
+                    self._update_stats(self.stats)
                 
                 for sub_index, sub in enumerate(subs, 1):
                     self.performance.add_subcategory()
                     
                     if error_count > 10:
-                        print(f"\n⚠️ Too many errors ({error_count}). Stopping...")
                         if not self._ask_continuation(error_count, len(results)):
                             break
                     
-                    if show_sub_progress:
-                        sub_progress.update(sub_index, f"Processing: {sub}")
-                    
-                    print(f"\n   📁 Subcategory: {sub}")
+                    # Update current subcategory
+                    self.stats['current_category'] = f"{cat} > {sub}"
+                    if hasattr(self, '_update_stats'):
+                        self._update_stats(self.stats)
                     
                     products = self.get_products(cat, sub)
                     
                     if not products:
-                        print(f"      ⚠️ No products found")
                         continue
                     
                     self.stats["total_products_found"] += len(products)
-                    print(f"      📊 Found {len(products)} products")
-                    
-                    product_progress = ProgressBar(
-                        total=len(products),
-                        width=35,
-                        prefix=f"      Products",
-                        show_eta=True
-                    )
                     
                     completed = 0
                     sub_error_count = 0
@@ -776,40 +776,33 @@ class MegaPCSite(BaseSite):
                             self.performance.add_product()
                             completed += 1
                             
-                            if completed % 5 == 0 or completed == len(products):
-                                remaining = len(products) - completed
-                                eta = self.performance.get_eta(remaining)
-                                speed = self.performance.get_speed_display()
-                                extra_info = f"New:{self.stats['new_products']} Skipped:{self.stats['skipped_duplicates']} E:{self.stats['errors']} | {speed} | ETA: {eta}"
-                                product_progress.update(completed, extra_info)
-                    
-                    product_progress.close()
+                            self.stats['current_product'] = f"{completed}/{len(products)}"
+                            if hasattr(self, '_update_stats'):
+                                self._update_stats(self.stats)
                     
                     if sub_error_count > 0:
-                        print(f"      ⚠️ Subcategory had {sub_error_count} errors")
-                    
-                    print(f"      ✅ Subcategory complete")
+                        logger.warning(f"Subcategory had {sub_error_count} errors")
                 
-                if show_sub_progress:
-                    sub_progress.close()
+                # Complete category - update stats
+                self.stats['completed_categories'] = i
+                if hasattr(self, '_update_stats'):
+                    self._update_stats(self.stats)
+                
+                logger.info(f"Progress: {i}/{total_categories} categories completed")
             
             # Log stats and generate recap
             log_scrape_stats(self.name, self.stats)
-            self._print_final_stats(results)
-            # End session and generate recap file
             recap_path = end_session()
-            print(f"📊 Scrape recap saved to: {recap_path}")
             
         except KeyboardInterrupt:
-            print("\n\n⚠️ Scrape interrupted by user!")
             logger.warning(f"{self.name} | INTERRUPTED")
         except Exception as e:
             logger.error(f"{self.name} | SCRAPE_ERROR | {e}")
-            print(f"\n❌ Scrape failed: {e}")
         finally:
             self._close_connections()
         
         self.performance.print_summary(self.name)
+        self._print_final_stats(results)
         
         logger.info(f"{self.name} | SCRAPE_DONE | total_new={len(results)} | stats={self.stats}")
         log_global(f"{self.name} | SCRAPE_DONE | total_new={len(results)}")

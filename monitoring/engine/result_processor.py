@@ -3,6 +3,7 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
 from Database.Redis.product_cache import ProductCache
 from Database.Postgresql.db import Database
+from core.shutdown_handler import register_flush_hook
 from monitoring.engine.adaptive_batch_processor import AdaptiveBatchProcessor
 from core.logger import setup_logger
 from core.utils.clean_date_logic import clean_date
@@ -28,6 +29,8 @@ class ResultProcessor:
         self.batch_processor = batch_processor or AdaptiveBatchProcessor(self.db)
         self.total_processed = 0
         self.total_changes = 0
+        register_flush_hook(self.flush_all, "ResultProcessor")
+
 
     # =====================================================
     # NORMALIZATION HELPERS

@@ -399,7 +399,7 @@ class RedisManager:
         redis_count = len(redis_keys)
         
         # Get DB products
-        db_products = db.load_products_for_monitoring()
+        db_products = db.load_products_for_monitoring(redis_db=True)
         db_count = len(db_products)
         
         self.print_info(f"Redis cache: {redis_count} products")

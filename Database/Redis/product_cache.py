@@ -1,15 +1,13 @@
 # Database/Redis/product_cache.py
 """
 Redis Cache Manager - Optimized for Real-time Performance
-Only stores essential data needed for monitoring and frontend.
-Heavy monitoring statistics stay in PostgreSQL.
 """
 from datetime import datetime
 import json
 import time
 from typing import Optional, Dict, Any
 
-from Database.Redis.Configuration.redis_client import RedisClient
+from Database.Redis.Configuration.redis_client import get_redis_client
 from Database.Redis.cache_keys import product_key
 from core.utils.cleaning_url_logic import normalize_url
 from core.logger import setup_logger
@@ -21,7 +19,12 @@ class ProductCache:
     """Redis cache manager - Stores ONLY essential real-time data"""
 
     def __init__(self):
-        self.redis = RedisClient().get_client()
+        # Get the redis client instance
+        self._redis_client = get_redis_client()
+        # Direct access to the redis client for all operations
+        self.redis = self._redis_client.get_client()
+        # Backward compatibility
+        self.client = self.redis
 
     # =====================================================
     # HELPER METHODS
@@ -71,12 +74,8 @@ class ProductCache:
             return {}
 
     def build_product_payload(self, product_data: Dict) -> Dict:
-        """
-        Build minimal Redis payload - ONLY essential fields
-        Monitoring stats are stored in PostgreSQL
-        """
+        """Build minimal Redis payload - ONLY essential fields"""
         payload = {
-            # ===== CORE PRODUCT DATA =====
             "url": normalize_url(product_data.get("url")),
             "price": float(product_data.get("price")) if product_data.get("price") is not None else 0,
             "discount_price": float(product_data.get("discount_price")) if product_data.get("discount_price") is not None else 0,
@@ -87,34 +86,22 @@ class ProductCache:
             "name": product_data.get("name"),
             "brand": product_data.get("brand"),
             "category": product_data.get("category"),
-            
-            # ===== REAL-TIME TRACKING (Essential for monitoring) =====
             "last_checked": int(time.time()),
             "is_enabled": product_data.get("is_enabled", True),
-            
-            # ===== MONITORING PRIORITY (For scheduling) =====
             "monitoring_priority": product_data.get("monitoring_priority", 3),
             "monitoring_group": product_data.get("monitoring_group", "regular"),
             "next_check_at": product_data.get("next_check_at"),
-            
-            # ===== FAILURE TRACKING (Quick access) =====
             "check_failures": product_data.get("check_failures", 0),
             "consecutive_errors": product_data.get("consecutive_errors", 0),
+            "status": product_data.get("status", "active"),
+            "invalid_reason": product_data.get("invalid_reason"),
+            "invalid_count": product_data.get("invalid_count", 0),
+            "removal_reason": product_data.get("removal_reason"),
         }
-        
         return payload
 
     def set_product(self, site: str, main_product_id: str, product_data: Dict, ttl: Optional[int] = None, pipe=None):
-        """
-        Set product in Redis cache (minimal payload)
-        
-        Args:
-            site: Site name
-            main_product_id: Product ID from site
-            product_data: Product data (only essential fields stored)
-            ttl: Time to live in seconds
-            pipe: Redis pipeline for batch operations
-        """
+        """Set product in Redis cache (minimal payload)"""
         key = product_key(site, main_product_id)
         payload = self.build_product_payload(product_data)
         serialized = json.dumps(payload, default=str)
@@ -210,10 +197,7 @@ class ProductCache:
     # =====================================================
     
     def has_changed(self, site: str, main_product_id: str, new_data: Dict) -> tuple:
-        """
-        Check if product has changed (compares essential fields only)
-        Returns: (has_changes, changed_fields_list)
-        """
+        """Check if product has changed (compares essential fields only)"""
         cached = self.get_product(site, main_product_id)
         if not cached:
             return True, []
