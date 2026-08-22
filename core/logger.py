@@ -20,7 +20,16 @@ DEBUG_MODE = True  # Set to False for production
 
 # Log levels
 LOG_LEVEL = logging.DEBUG if DEBUG_MODE else logging.INFO
-CONSOLE_LOG_LEVEL = logging.INFO  # Console shows INFO and above, DEBUG goes to files
+
+# =====================================================
+# CONSOLE LOG LEVEL - COMPLETELY DISABLE CONSOLE LOGGING
+# =====================================================
+# Set to logging.CRITICAL to only show CRITICAL (essentially nothing)
+# Set to logging.ERROR to show errors only
+# Set to logging.WARNING for warnings and above
+CONSOLE_LOG_LEVEL = logging.CRITICAL  # <-- Only CRITICAL (almost nothing)
+# OR use logging.ERROR if you want to see errors
+# CONSOLE_LOG_LEVEL = logging.ERROR
 
 
 # =====================================================
@@ -74,9 +83,11 @@ def setup_logger(site_name: str = "global", log_type: str = "scraper", level: Op
         logger.handlers.clear()
     
     logger.setLevel(level)
+    # Prevent propagation to root logger
+    logger.propagate = False
 
     # ---------------------------------
-    # FILE HANDLER (All logs)
+    # FILE HANDLER (All logs go to file)
     # ---------------------------------
     file_handler = logging.FileHandler(file_path, encoding="utf-8")
     file_handler.setLevel(level)  # All levels go to file
@@ -89,17 +100,19 @@ def setup_logger(site_name: str = "global", log_type: str = "scraper", level: Op
     logger.addHandler(file_handler)
 
     # ---------------------------------
-    # CONSOLE HANDLER (INFO and above only)
+    # CONSOLE HANDLER - COMPLETELY DISABLED (CRITICAL level)
     # ---------------------------------
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(CONSOLE_LOG_LEVEL)  # Console shows INFO and above
-    
-    console_formatter = logging.Formatter(
-        "%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-        datefmt="%H:%M:%S"
-    )
-    console_handler.setFormatter(console_formatter)
-    logger.addHandler(console_handler)
+    # Only add console handler if we want to show anything
+    if CONSOLE_LOG_LEVEL < logging.CRITICAL:
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(CONSOLE_LOG_LEVEL)
+        
+        console_formatter = logging.Formatter(
+            "%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+            datefmt="%H:%M:%S"
+        )
+        console_handler.setFormatter(console_formatter)
+        logger.addHandler(console_handler)
 
     # Add daily separator
     add_daily_separator(file_path)
@@ -108,12 +121,57 @@ def setup_logger(site_name: str = "global", log_type: str = "scraper", level: Op
 
 
 # =====================================================
-# DEBUG LOGGER (Always DEBUG level)
+# SILENT LOGGER - No console output at all
+# =====================================================
+
+def setup_silent_logger(site_name: str = "global", log_type: str = "scraper") -> logging.Logger:
+    """
+    Setup a logger with NO console output at all.
+    All logs go only to files.
+    """
+    # Save current console level
+    global CONSOLE_LOG_LEVEL
+    original_level = CONSOLE_LOG_LEVEL
+    
+    # Temporarily set to CRITICAL to disable console
+    CONSOLE_LOG_LEVEL = logging.CRITICAL
+    
+    logger = setup_logger(site_name, log_type)
+    
+    # Restore original level
+    CONSOLE_LOG_LEVEL = original_level
+    
+    return logger
+
+
+# =====================================================
+# VERBOSE LOGGER - For debugging with console output
+# =====================================================
+
+def setup_verbose_logger(site_name: str = "global", log_type: str = "scraper") -> logging.Logger:
+    """
+    Setup a logger with console output at INFO level for debugging.
+    Use this for specific loggers that need console visibility.
+    """
+    global CONSOLE_LOG_LEVEL
+    original_level = CONSOLE_LOG_LEVEL
+    CONSOLE_LOG_LEVEL = logging.INFO
+    
+    logger = setup_logger(site_name, log_type)
+    
+    CONSOLE_LOG_LEVEL = original_level
+    
+    return logger
+
+
+# =====================================================
+# DEBUG LOGGER (Always DEBUG level, file only)
 # =====================================================
 
 def setup_debug_logger(site_name: str = "global", log_type: str = "debug") -> logging.Logger:
     """
     Setup a logger specifically for debugging with DEBUG level.
+    No console output.
     """
     return setup_logger(site_name, log_type, level=logging.DEBUG)
 
@@ -156,6 +214,48 @@ _global_logger = setup_logger("global")
 def log_global(message: str):
     """Log to global log file"""
     _global_logger.info(message)
+
+
+# =====================================================
+# CONSOLE VERBOSITY CONTROL
+# =====================================================
+
+def set_console_verbosity(level: int):
+    """
+    Dynamically change console log level.
+    
+    Usage:
+        set_console_verbosity(logging.CRITICAL)  # Disable console (default)
+        set_console_verbosity(logging.ERROR)     # Show errors only
+        set_console_verbosity(logging.WARNING)   # Show warnings and errors
+        set_console_verbosity(logging.INFO)      # Show everything
+    """
+    global CONSOLE_LOG_LEVEL
+    CONSOLE_LOG_LEVEL = level
+    
+    # Update all existing loggers
+    for logger_name in logging.root.manager.loggerDict:
+        logger_obj = logging.getLogger(logger_name)
+        for handler in logger_obj.handlers:
+            if isinstance(handler, logging.StreamHandler):
+                handler.setLevel(level)
+    
+    _global_logger.info(f"CONSOLE_VERBOSITY | set to {logging.getLevelName(level)}")
+
+
+def disable_console_logging():
+    """Completely disable all console logging"""
+    set_console_verbosity(logging.CRITICAL)
+
+
+def enable_console_logging(level: int = logging.INFO):
+    """Enable console logging at specified level"""
+    set_console_verbosity(level)
+
+
+def get_console_verbosity() -> str:
+    """Get current console log level"""
+    return logging.getLevelName(CONSOLE_LOG_LEVEL)
 
 
 # =====================================================
@@ -297,12 +397,58 @@ def log_session_end(logger: logging.Logger, site: str, session_id: str = None, s
 
 
 # =====================================================
+# PROGRESS LOGGING - Dashboard only
+# =====================================================
+
+def log_progress(message: str, level: int = logging.INFO):
+    """
+    Log progress messages - only to file, not console.
+    """
+    # Create a logger that only writes to file
+    temp_logger = logging.getLogger("progress")
+    
+    if not temp_logger.handlers:
+        temp_logger.setLevel(logging.DEBUG)
+        temp_logger.propagate = False
+        
+        # File handler only (no console)
+        os.makedirs(BASE_LOG_DIR, exist_ok=True)
+        file_handler = logging.FileHandler(os.path.join(BASE_LOG_DIR, "progress.log"), encoding="utf-8")
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(logging.Formatter("%(asctime)s | %(message)s", datefmt="%H:%M:%S"))
+        temp_logger.addHandler(file_handler)
+        
+        # NO console handler - progress only goes to file
+    
+    temp_logger.log(level, message)
+
+
+# =====================================================
+# SUPPRESS HTTP LOGGING
+# =====================================================
+
+def suppress_http_logging():
+    """Suppress verbose HTTP request logging"""
+    # Suppress urllib3 and requests logging
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("requests").setLevel(logging.WARNING)
+    logging.getLogger("urllib3.connectionpool").setLevel(logging.WARNING)
+    logging.getLogger("urllib3.util.retry").setLevel(logging.WARNING)
+
+
+# Call this on import to suppress HTTP logging by default
+suppress_http_logging()
+
+
+# =====================================================
 # EXPORTS
 # =====================================================
 
 __all__ = [
     'setup_logger',
+    'setup_silent_logger',
     'setup_debug_logger',
+    'setup_verbose_logger',
     'get_site_logger',
     'log_global',
     'log_debug',
@@ -312,8 +458,15 @@ __all__ = [
     'log_error',
     'log_session_start',
     'log_session_end',
+    'log_progress',
     'write_product_result',
     'sanitize_name',
+    'set_console_verbosity',
+    'disable_console_logging',
+    'enable_console_logging',
+    'get_console_verbosity',
+    'suppress_http_logging',
     'DEBUG_MODE',
     'LOG_LEVEL',
+    'CONSOLE_LOG_LEVEL',
 ]

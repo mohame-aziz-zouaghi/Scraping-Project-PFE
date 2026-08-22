@@ -1,6 +1,7 @@
 # Database/Redis/product_cache.py
 """
 Redis Cache Manager - Optimized for Real-time Performance
+Uses shared connection pool
 """
 from datetime import datetime
 import json
@@ -19,12 +20,17 @@ class ProductCache:
     """Redis cache manager - Stores ONLY essential real-time data"""
 
     def __init__(self):
-        # Get the redis client instance
+        # =====================================================
+        # Get shared Redis client (uses connection pool)
+        # =====================================================
         self._redis_client = get_redis_client()
-        # Direct access to the redis client for all operations
         self.redis = self._redis_client.get_client()
-        # Backward compatibility
         self.client = self.redis
+        
+        # Log that we're using the pool
+        if self.redis:
+            pool_stats = self._redis_client.get_pool_stats()
+            logger.debug(f"ProductCache using Redis pool: {pool_stats}")
 
     # =====================================================
     # HELPER METHODS
@@ -118,6 +124,7 @@ class ProductCache:
                 self.redis.set(key, serialized)
         
         logger.debug(f"Product cached: {site}/{main_product_id}")
+
 
     def update_product(self, site: str, main_product_id: str, updated_data: Dict, ttl: Optional[int] = None) -> bool:
         """Update entire product in Redis with new data"""

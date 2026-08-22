@@ -38,8 +38,7 @@ class TunisiaNetSite(BaseSite):
         self.base_url = "https://www.tunisianet.com.tn"
         self.search_url = "https://www.tunisianet.com.tn/recherche"
 
-        self.requester = SmartRequester(
-            site_name="tunisianet",
+        self.set_requester_config(
             requests_per_minute=100,
             max_retries=4,
             timeout=45,
@@ -50,51 +49,32 @@ class TunisiaNetSite(BaseSite):
 
         self.lock = threading.Lock()
         self.seen_products: Set[str] = set()
-        self.cache = None
-        self.db = None
-        self.redis_client = None
         self.test_mode = False
         self.test_limit = 5
+        
+        # Batch size for this site
+        self.batch_size = 50
 
-    def _init_connections(self):
+
+
+    def get_requester_config(self) -> Dict:
+        return {
+            "requests_per_minute": 100,
+            "max_retries": 4,
+            "timeout": 45,
+            "use_session": True,
+            "use_referer": True,
+            "delay_between_requests": (0.5, 2.0),
+        }
+
+    def _add_error(self, error_msg: str):
+        """Helper method to add error to dashboard"""
         try:
-            self.cache = ProductCache()
-            self.redis_client = self.cache.redis
-            logger.info(f"{self.name} | REDIS_CONNECTED")
+            from scraping.engine.multi_scrape_progress import get_multi_scrape_progress
+            progress = get_multi_scrape_progress()
+            progress.increment_error(self.name, error_msg)
         except Exception as e:
-            logger.error(f"{self.name} | REDIS_CONNECTION_ERROR | {e}")
-            raise
-
-        try:
-            self.db = Database()
-            logger.info(f"{self.name} | POSTGRES_CONNECTED")
-        except Exception as e:
-            logger.error(f"{self.name} | POSTGRES_CONNECTION_ERROR | {e}")
-            raise
-
-    def _close_connections(self):
-        try:
-            if self.db:
-                self.db.close()
-                logger.info(f"{self.name} | POSTGRES_CLOSED")
-        except Exception as e:
-            logger.error(f"{self.name} | POSTGRES_CLOSE_ERROR | {e}")
-
-    def _make_json_serializable(self, obj: Any) -> Any:
-        if obj is None:
-            return None
-        if isinstance(obj, (str, int, float, bool)):
-            return obj
-        if isinstance(obj, dict):
-            return {k: self._make_json_serializable(v) for k, v in obj.items()}
-        if isinstance(obj, (list, tuple)):
-            return [self._make_json_serializable(item) for item in obj]
-        if hasattr(obj, 'isoformat'):
-            return obj.isoformat()
-        try:
-            return str(obj)
-        except:
-            return None
+            logger.debug(f"{self.name} | ERROR_DASHBOARD_FAILED | {e}")
 
     def search(self, query: str) -> Dict:
         logger.info(f"{self.name} | SEARCH_START | {query}")
@@ -161,6 +141,7 @@ class TunisiaNetSite(BaseSite):
             products = parse_tunisianet_products(html, self.name.lower())
         except Exception as e:
             logger.error(f"{self.name} | PARSE_CATEGORY_ERROR | {url} | {e}")
+            self._add_error(f"Category page parse error: {str(e)[:50]}")
             return []
 
         if products is None:
@@ -185,112 +166,6 @@ class TunisiaNetSite(BaseSite):
             logger.error(f"{self.name} | PARSE_EXCEPTION | {product_id} | {e}")
             return None
 
-    def _product_exists(self, product_id: str) -> bool:
-        if self.cache:
-            try:
-                cached = self.cache.get_product(self.name.lower(), product_id)
-                if cached:
-                    return True
-            except:
-                pass
-
-        if self.db:
-            try:
-                existing = self.db.get_product_by_site_and_main_id(self.name.lower(), product_id)
-                if existing:
-                    return True
-            except:
-                pass
-
-        return False
-
-    def _save_new_product(self, product: Dict, product_id: str) -> bool:
-        try:
-            if product is None:
-                logger.warning(f"{self.name} | SAVE_EMPTY_PRODUCT | {product_id}")
-                return False
-            
-            if not isinstance(product, dict):
-                logger.warning(f"{self.name} | SAVE_INVALID_PRODUCT | {product_id} | type={type(product)}")
-                return False
-            
-            url = product.get("url", "")
-            if not url:
-                logger.warning(f"{self.name} | SAVE_NO_URL | {product_id}")
-                return False
-            
-            price = product.get("price", 0)
-            if price is None or price <= 0:
-                logger.warning(f"{self.name} | SAVE_NO_PRICE | {product_id} | price={price}")
-                return False
-            
-            cache_payload = {
-                "url": str(url),
-                "price": float(price),
-                "discount_price": float(product.get("discount_price", 0) or 0),
-                "discount_amount": float(product.get("discount_amount", 0) or 0),
-                "availability": str(product.get("availability", "OutOfStock") or "OutOfStock"),
-                "special_id": str(product.get("special_id")) if product.get("special_id") else None,
-                "price_valid_until": str(product.get("price_valid_until")) if product.get("price_valid_until") else None,
-                "last_checked": int(time.time()),
-                "is_enabled": True
-            }
-            
-            saved_to_redis = False
-            saved_to_pg = False
-            
-            if self.cache:
-                try:
-                    self.cache.set_product(self.name.lower(), product_id, cache_payload, ttl=None)
-                    saved_to_redis = True
-                    with self.lock:
-                        self.stats["redis_saved"] += 1
-                except Exception as redis_error:
-                    logger.error(f"{self.name} | REDIS_SAVE_ERROR | {product_id} | {redis_error}")
-            
-            if self.db:
-                try:
-                    db_product = {
-                        "site": self.name.lower(),
-                        "main_product_id": product_id,
-                        "special_id": product.get("special_id"),
-                        "url": url,
-                        "name": product.get("name", ""),
-                        "price": float(price),
-                        "discount_price": float(product.get("discount_price", 0) or 0),
-                        "discount_amount": float(product.get("discount_amount", 0) or 0),
-                        "availability": product.get("availability", "OutOfStock") or "OutOfStock",
-                        "price_valid_until": product.get("price_valid_until"),
-                        "brand": product.get("brand"),
-                        "category": product.get("category"),
-                        "description": product.get("description", ""),
-                        "short_description": product.get("short_description", []),
-                        "images": product.get("images", []),
-                        "main_image": product.get("main_image"),
-                        "is_enabled": True
-                    }
-                    
-                    db_product = self._make_json_serializable(db_product)
-                    self.db.upsert_products([db_product])
-                    saved_to_pg = True
-                    with self.lock:
-                        self.stats["postgres_saved"] += 1
-                except Exception as pg_error:
-                    logger.error(f"{self.name} | PG_SAVE_ERROR | {product_id} | {pg_error}")
-            
-            if saved_to_redis and saved_to_pg:
-                with self.lock:
-                    self.stats["new_products"] += 1
-                write_product_result(product, self.name)
-                return True
-            else:
-                logger.warning(f"{self.name} | PARTIAL_SAVE | {product_id} | Redis={saved_to_redis}, PG={saved_to_pg}")
-                return False
-                
-        except Exception as e:
-            logger.error(f"{self.name} | SAVE_ERROR | {product_id} | {e}")
-            return False
-
     def process_product(self, product_data: Dict) -> Optional[Dict]:
         try:
             if product_data is None:
@@ -312,6 +187,7 @@ class TunisiaNetSite(BaseSite):
                 logger.warning(f"{self.name} | SKIP_NO_ID | product_id={product_id}")
                 with self.lock:
                     self.stats["errors"] += 1
+                self._add_error(f"Product missing ID or URL: {product_id or 'unknown'}")
                 return None
 
             product_id = str(product_id)
@@ -322,6 +198,7 @@ class TunisiaNetSite(BaseSite):
                     return None
                 self.seen_products.add(product_id)
 
+            # Use inherited _product_exists from BaseSite
             if self._product_exists(product_id):
                 with self.lock:
                     self.stats["skipped_duplicates"] += 1
@@ -335,15 +212,14 @@ class TunisiaNetSite(BaseSite):
                 logger.error(f"{self.name} | PARSE_EXCEPTION | {product_id} | {parse_error}")
                 with self.lock:
                     self.stats["errors"] += 1
+                self._add_error(f"Parse error {product_id}: {str(parse_error)[:50]}")
                 return None
             
-            # =====================================================
-            # CRITICAL: Validate details BEFORE using .get()
-            # =====================================================
             if details is None:
                 logger.warning(f"{self.name} | PARSE_FAILED_NONE | {product_id}")
                 with self.lock:
                     self.stats["errors"] += 1
+                self._add_error(f"Parse returned None: {product_id}")
                 return None
             
             if not isinstance(details, dict):
@@ -352,9 +228,6 @@ class TunisiaNetSite(BaseSite):
                     self.stats["errors"] += 1
                 return None
 
-            # =====================================================
-            # NOW SAFE to use .get() on details
-            # =====================================================
             if not details.get("name"):
                 logger.warning(f"{self.name} | DETAILS_NO_NAME | {product_id}")
                 with self.lock:
@@ -374,27 +247,26 @@ class TunisiaNetSite(BaseSite):
                 return None
 
             logger.info(f"{self.name} | NEW_PRODUCT | {product_id}")
-            details['is_new'] = True
 
+            # USE PARENT'S _save_new_product (which uses batching)
             try:
-                save_result = self._save_new_product(details, product_id)
+                save_result = super()._save_new_product(details, product_id)
                 if not save_result:
                     logger.warning(f"{self.name} | SAVE_FAILED | {product_id}")
                     with self.lock:
                         self.stats["errors"] += 1
+                    self._add_error(f"Save failed: {product_id}")
                     return None
             except Exception as save_error:
                 logger.error(f"{self.name} | SAVE_EXCEPTION | {product_id} | {save_error}")
                 with self.lock:
                     self.stats["errors"] += 1
+                self._add_error(f"Save exception {product_id}: {str(save_error)[:50]}")
                 return None
 
             return details
 
         except Exception as e:
-            # =====================================================
-            # SAFE error handling - don't call .get() on None
-            # =====================================================
             product_id = "unknown"
             try:
                 if product_data and isinstance(product_data, dict):
@@ -405,6 +277,7 @@ class TunisiaNetSite(BaseSite):
             logger.error(f"{self.name} | PRODUCT_ERROR | {product_id} | {e}")
             with self.lock:
                 self.stats["errors"] += 1
+            self._add_error(f"Product error {product_id}: {str(e)[:50]}")
             return None
 
     def process_batch(self, products: List[Dict], batch_name: str = "Batch") -> List[Dict]:
@@ -448,6 +321,7 @@ class TunisiaNetSite(BaseSite):
                     logger.error(f"{self.name} | BATCH_ERROR | {e}")
                     with self.lock:
                         self.stats["errors"] += 1
+                    self._add_error(f"Batch worker error: {str(e)[:50]}")
 
                 completed += 1
 
@@ -465,6 +339,7 @@ class TunisiaNetSite(BaseSite):
         first_page_html = self.requester.get_html(f"{category_url}?page=1")
         if not first_page_html:
             logger.warning(f"{self.name} | CATEGORY_NO_PAGE")
+            self._add_error(f"Category no page: {category_name}")
             return results
 
         total_pages = self.get_category_page_count(first_page_html)
@@ -473,16 +348,22 @@ class TunisiaNetSite(BaseSite):
         self.start_category(category_name, total_pages)
 
         for page in range(1, total_pages + 1):
-            products = self.get_category_products(category_url, page)
+            try:
+                products = self.get_category_products(category_url, page)
 
-            if not products:
+                if not products:
+                    continue
+
+                self.stats["total_products_found"] += len(products)
+                self.update_category_page(page)
+
+                page_results = self.process_batch(products, f"{category_name}")
+                results.extend(page_results)
+            except Exception as e:
+                error_msg = f"Page {page} failed in {category_name}: {str(e)[:50]}"
+                logger.error(f"{self.name} | PAGE_ERROR | {category_name} | page={page} | {e}")
+                self._add_error(error_msg)
                 continue
-
-            self.stats["total_products_found"] += len(products)
-            self.update_category_page(page)
-
-            page_results = self.process_batch(products, f"{category_name}")
-            results.extend(page_results)
 
         logger.info(f"{self.name} | CATEGORY_FINISHED | new_products={len(results)}")
         return results
@@ -492,21 +373,27 @@ class TunisiaNetSite(BaseSite):
         results = []
 
         for brand in SEARCH_BRANDS:
-            logger.info(f"{self.name} | BRAND_START | {brand}")
+            try:
+                logger.info(f"{self.name} | BRAND_START | {brand}")
 
-            search_results = self.search(brand)
-            products = search_results.get("products", [])
+                search_results = self.search(brand)
+                products = search_results.get("products", [])
 
-            if not products:
-                logger.info(f"{self.name} | BRAND_EMPTY")
+                if not products:
+                    logger.info(f"{self.name} | BRAND_EMPTY")
+                    continue
+
+                self.stats["total_products_found"] += len(products)
+
+                brand_results = self.process_batch(products, f"Brand: {brand}")
+                results.extend(brand_results)
+
+                logger.info(f"{self.name} | BRAND_DONE | new_products={len(brand_results)}")
+            except Exception as e:
+                error_msg = f"Brand {brand} failed: {str(e)[:50]}"
+                logger.error(f"{self.name} | BRAND_ERROR | {brand} | {e}")
+                self._add_error(error_msg)
                 continue
-
-            self.stats["total_products_found"] += len(products)
-
-            brand_results = self.process_batch(products, f"Brand: {brand}")
-            results.extend(brand_results)
-
-            logger.info(f"{self.name} | BRAND_DONE | new_products={len(brand_results)}")
 
         return results
 
@@ -529,8 +416,22 @@ class TunisiaNetSite(BaseSite):
         self.performance = PerformanceTracker()
         results = []
 
+        # =====================================================
+        # RESET DASHBOARD STATS FOR NEW SCRAPE CYCLE
+        # =====================================================
         try:
-            self._init_connections()
+            from scraping.engine.multi_scrape_progress import get_multi_scrape_progress
+            progress = get_multi_scrape_progress()
+            progress.reset_site(self.name)
+            logger.info(f"{self.name} | DASHBOARD_RESET | new cycle")
+        except Exception as e:
+            logger.debug(f"{self.name} | DASHBOARD_RESET_ERROR | {e}")
+
+        # Initialize connections using inherited method
+        try:
+            if not self._init_connections():
+                logger.error(f"{self.name} | CONNECTION_FAILED")
+                return []
         except Exception as e:
             logger.error(f"{self.name} | CONNECTION_FAILED | {e}")
             return []
@@ -570,12 +471,19 @@ class TunisiaNetSite(BaseSite):
                 if hasattr(self, '_update_stats'):
                     self._update_stats(self.stats)
 
-                category_results = self.scrape_category_with_progress(category_name, category_url)
-                results.extend(category_results)
+                try:
+                    category_results = self.scrape_category_with_progress(category_name, category_url)
+                    results.extend(category_results)
+                except Exception as e:
+                    error_msg = f"Category '{category_name}' failed: {str(e)[:50]}"
+                    logger.error(f"{self.name} | CATEGORY_ERROR | {category_name} | {e}")
+                    self._add_error(error_msg)
+                    continue
 
                 self.complete_category()
-
-                logger.info(f"Progress: {i}/{total_categories} categories completed")
+                
+                batch_size = self.get_pending_batch_size()
+                logger.info(f"Progress: {i}/{total_categories} categories completed | batch={batch_size}")
 
             logger.info("SCRAPING BRANDS (FALLBACK)")
             self.stats['current_category'] = "Brands (Fallback)"
@@ -583,17 +491,48 @@ class TunisiaNetSite(BaseSite):
             if hasattr(self, '_update_stats'):
                 self._update_stats(self.stats)
 
-            brand_results = self.scrape_brands()
-            results.extend(brand_results)
+            try:
+                brand_results = self.scrape_brands()
+                results.extend(brand_results)
+            except Exception as e:
+                error_msg = f"Brands fallback failed: {str(e)[:50]}"
+                logger.error(f"{self.name} | BRANDS_ERROR | {e}")
+                self._add_error(error_msg)
 
             self.complete_all_categories()
             self._print_final_stats(results)
 
         except KeyboardInterrupt:
             logger.warning(f"{self.name} | INTERRUPTED")
+            try:
+                from scraping.engine.multi_scrape_progress import get_multi_scrape_progress
+                progress = get_multi_scrape_progress()
+                progress.set_status(self.name, "⚠️ Interrupted")
+            except:
+                pass
         except Exception as e:
+            error_msg = f"Scrape failed: {str(e)[:50]}"
             logger.error(f"{self.name} | SCRAPE_ERROR | {e}")
+            import traceback
+            traceback.print_exc()
+            self._add_error(error_msg)
         finally:
+            # =====================================================
+            # FLUSH ANY REMAINING PRODUCTS
+            # =====================================================
+            batch_size = self.get_pending_batch_size()
+            if batch_size > 0:
+                logger.info(f"{self.name} | FLUSHING_PENDING | {batch_size} products")
+                try:
+                    self.flush_pending_batch()
+                except Exception as e:
+                    error_msg = f"Flush failed: {str(e)[:50]}"
+                    logger.error(f"{self.name} | FLUSH_ERROR | {e}")
+                    self._add_error(error_msg)
+            
+            # Log final summary
+            self.log_final_summary(results)
+            
             self._close_connections()
 
         self.performance.print_summary(self.name)

@@ -82,7 +82,7 @@ class ShutdownHandler:
     
     def shutdown(self, exit_code: int = 0):
         """
-        Perform graceful shutdown
+        Perform graceful shutdown with Redis pool cleanup
         """
         if self.shutdown_in_progress:
             return
@@ -106,6 +106,22 @@ class ShutdownHandler:
                     hook['func']()
                 except Exception as e:
                     logger.error(f"   ❌ Shutdown hook {hook['name']} failed: {e}")
+            
+            # =====================================================
+            # Close Redis connection pool on shutdown
+            # =====================================================
+            try:
+                from Database.Redis.Configuration.redis_client import get_redis_client
+                redis_client = get_redis_client()
+                if redis_client:
+                    # Close the connection pool
+                    redis_client.close_pool()
+                    logger.info("✅ Redis connection pool closed")
+            except ImportError:
+                # Redis module might not be available
+                pass
+            except Exception as e:
+                logger.error(f"Redis pool close error: {e}")
             
             print("="*60)
             if flush_success:
@@ -167,5 +183,5 @@ def flush_all():
 
 
 def shutdown(exit_code: int = 0):
-    """Graceful shutdown"""
+    """Graceful shutdown with Redis pool cleanup"""
     return get_shutdown_handler().shutdown(exit_code)

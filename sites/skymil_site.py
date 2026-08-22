@@ -1,525 +1,567 @@
-# sites/skymil.py
-import json
-import time
-import threading
-from typing import Dict, List, Optional, Any, Set
-from tqdm import tqdm
-from core.load_ids import load_existing_product_ids
+# sites/mytek.py
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Dict
+
+from bs4 import BeautifulSoup
+
+from config.categoriesMytek import CATEGORIES
 from core.logger import setup_logger, log_global, write_product_result
+
 from core.performance import PerformanceTracker
-from core.Web.product_schema import create_product_schema
-from Database.Redis.product_cache import ProductCache
-from Database.Postgresql.db import Database
+from core.thread_manager import ThreadManager
+
+from parsers.mytek.mytek_search_parser import parse_mytek_products
+from parsers.mytek.mytek_product_parser import parse_mytek_product_page
+
+from config.brands import SEARCH_BRANDS
+
 from sites.base_site import BaseSite
 
-logger = setup_logger("skymil", "scraper")
-dup_logger = setup_logger("skymil", "duplication")
+import threading
+import time
+import os
 
 
-class SkymilSite(BaseSite):
-    """Skymil scraper - ONLY adds NEW products, skips existing ones"""
+logger = setup_logger("mytek", "scraper")
+dup_logger = setup_logger("mytek", "duplication")
+
+
+class MytekSite(BaseSite):
+
+    name = "MYTEK"
+    BASE_URL = "https://www.mytek.tn/"
 
     def __init__(self):
         super().__init__()
-        
-        self.name = "SKYMIL"
-        self.scrape_interval = 86400  # 24 hours between scrapes
+        self.lock = threading.Lock()
+        self.total_products = 0
+        self.start_time = time.time()
         self.performance = PerformanceTracker()
 
-        # FILE PATHS
-        self.products_file = "config/SkymilProducts.json"
-        self.brands_file = "config/SkymilBrands.json"
-        self.categories_file = "config/SkymilCategories.json"
+        self.thread_manager = ThreadManager(
+            self.name,
+            self.start_time,
+            lambda: self.total_products
+        )
         
-        # Thread safety
-        self.lock = threading.Lock()
-        self.seen_products: Set[str] = set()
+        # =====================================================
+        # BATCH CONFIGURATION - Use parent's batching
+        # =====================================================
+        self.batch_size = 50
         
-        # Connections
-        self.cache = None
-        self.db = None
-        self.redis_client = None
-
-    # =====================================================
-    # CONNECTION MANAGEMENT
-    # =====================================================
-    
-    def _init_connections(self):
-        """Initialize database and cache connections"""
-        try:
-            self.cache = ProductCache()
-            self.redis_client = self.cache.redis
-            logger.info(f"{self.name} | REDIS_CONNECTED")
-        except Exception as e:
-            logger.error(f"{self.name} | REDIS_CONNECTION_ERROR | {e}")
-            raise
-        
-        try:
-            self.db = Database()
-            logger.info(f"{self.name} | POSTGRES_CONNECTED")
-        except Exception as e:
-            logger.error(f"{self.name} | POSTGRES_CONNECTION_ERROR | {e}")
-            raise
-    
-    def _close_connections(self):
-        """Close database and cache connections"""
-        try:
-            if self.db:
-                self.db.close()
-                logger.info(f"{self.name} | POSTGRES_CLOSED")
-        except Exception as e:
-            logger.error(f"{self.name} | POSTGRES_CLOSE_ERROR | {e}")
-        
-        try:
-            if self.cache and self.redis_client:
-                pass
-                logger.info(f"{self.name} | REDIS_CLOSED")
-        except Exception as e:
-            logger.error(f"{self.name} | REDIS_CLOSE_ERROR | {e}")
-
-    # =====================================================
-    # JSON SERIALIZATION
-    # =====================================================
-    
-    def _make_json_serializable(self, obj: Any) -> Any:
-        """Convert non-serializable objects to JSON serializable format"""
-        if obj is None:
-            return None
-        if isinstance(obj, (str, int, float, bool)):
-            return obj
-        if isinstance(obj, dict):
-            return {k: self._make_json_serializable(v) for k, v in obj.items()}
-        if isinstance(obj, (list, tuple)):
-            return [self._make_json_serializable(item) for item in obj]
-        if hasattr(obj, 'isoformat'):
-            return obj.isoformat()
-        try:
-            return str(obj)
-        except:
-            return None
-
-    # =====================================================
-    # LOAD DATA
-    # =====================================================
-    
-    def load_data(self):
-        logger.info(f"{self.name} | LOAD_DATA")
-
-        with open(self.products_file, "r", encoding="utf-8") as f:
-            products = json.load(f)
-
-        with open(self.brands_file, "r", encoding="utf-8") as f:
-            brands = json.load(f)
-
-        with open(self.categories_file, "r", encoding="utf-8") as f:
-            categories = json.load(f)
-
-        # MAPS
-        brand_map = {b["id"]: b["name"] for b in brands}
-        category_map = {c["id"]: c["name"] for c in categories}
-
-        logger.info(
-            f"{self.name} | DATA_LOADED | products={len(products)} | brands={len(brand_map)} | categories={len(category_map)}"
+        # =====================================================
+        # CONFIGURE SMART REQUESTER FOR MYTEK
+        # =====================================================
+        self.set_requester_config(
+            site_name="mytek",
+            requests_per_minute=20,
+            max_retries=4,
+            timeout=45,
+            use_session=True,
+            use_referer=True,
+            delay_between_requests=(0.5, 2.0)
         )
 
-        return products, brand_map, category_map
+    def get_requester_config(self) -> Dict:
+        """Override to provide Mytek-specific requester config"""
+        return {
+            "requests_per_minute": 20,
+            "max_retries": 4,
+            "timeout": 45,
+            "use_session": True,
+            "use_referer": True,
+            "delay_between_requests": (0.5, 2.0),
+        }
 
-    # =====================================================
-    # CHECK IF PRODUCT EXISTS
-    # =====================================================
-    
-    def _product_exists(self, product_id: str) -> bool:
-        """Check if product already exists in Redis or PostgreSQL"""
-        # Check Redis first (fast)
-        if self.cache:
-            cached = self.cache.get_product(self.name.lower(), product_id)
-            if cached:
-                return True
-        
-        # Check PostgreSQL
-        if self.db:
-            existing = self.db.get_product_by_site_and_main_id(self.name.lower(), product_id)
-            if existing:
-                return True
-        
-        return False
-
-    # =====================================================
-    # SAVE NEW PRODUCT
-    # =====================================================
-    
-    def _save_new_product(self, product: Dict, product_id: str) -> bool:
-        """Save ONLY new product to Redis cache and PostgreSQL"""
+    def _add_error(self, error_msg: str):
+        """Helper method to add error to dashboard"""
         try:
-            # Prepare cache payload
-            cache_payload = {
-                "url": str(product.get("url", "")),
-                "price": float(product.get("price", 0)),
-                "discount_price": float(product.get("discount_price", 0)),
-                "discount_amount": float(product.get("discount_amount", 0)),
-                "availability": str(product.get("availability", "OutOfStock")),
-                "special_id": str(product.get("special_id")) if product.get("special_id") else None,
-                "price_valid_until": str(product.get("price_valid_until")) if product.get("price_valid_until") else None,
-                "last_checked": int(time.time()),
-                "is_enabled": True
-            }
-            
-            saved_to_redis = False
-            saved_to_pg = False
-            
-            # Save to Redis
-            if self.cache:
-                self.cache.set_product(self.name.lower(), product_id, cache_payload, ttl=None)
-                saved_to_redis = True
-                with self.lock:
-                    self.stats["redis_saved"] += 1
-            
-            # Save to PostgreSQL
-            if self.db:
-                db_product = {
-                    "site": self.name.lower(),
-                    "main_product_id": product_id,
-                    "special_id": product.get("special_id"),
-                    "url": product.get("url"),
-                    "name": product.get("name"),
-                    "price": float(product.get("price", 0)),
-                    "discount_price": float(product.get("discount_price", 0)),
-                    "discount_amount": float(product.get("discount_amount", 0)),
-                    "availability": product.get("availability", "OutOfStock"),
-                    "price_valid_until": product.get("price_valid_until"),
-                    "brand": product.get("brand"),
-                    "category": product.get("category"),
-                    "description": product.get("description", ""),
-                    "short_description": product.get("short_description", []),
-                    "images": product.get("images", []),
-                    "main_image": product.get("main_image"),
-                    "is_enabled": True
-                }
-                
-                db_product = self._make_json_serializable(db_product)
-                self.db.upsert_products([db_product])
-                saved_to_pg = True
-                with self.lock:
-                    self.stats["postgres_saved"] += 1
-            
-            if saved_to_redis and saved_to_pg:
-                with self.lock:
-                    self.stats["new_products"] += 1
-                write_product_result(product, self.name)
-                return True
-            else:
-                logger.warning(f"{self.name} | PARTIAL_SAVE | {product_id}")
-                return False
-                
+            from scraping.engine.multi_scrape_progress import get_multi_scrape_progress
+            progress = get_multi_scrape_progress()
+            progress.increment_error(self.name, error_msg)
         except Exception as e:
-            logger.error(f"{self.name} | SAVE_ERROR | {product_id} | {e}")
+            logger.debug(f"{self.name} | ERROR_DASHBOARD_FAILED | {e}")
+
+    # =====================================================
+    # CATEGORY DISCOVERY - Using SmartRequester
+    # =====================================================
+    
+    def extract_categories(self):
+        logger.info(f"{self.name} | CATEGORY_DISCOVERY_START")
+        log_global(f"{self.name} | CATEGORY_DISCOVERY_START")
+
+        # Use SmartRequester instead of get()
+        html = self.requester.get_html(self.BASE_URL)
+
+        if not html:
+            logger.error(f"{self.name} | CATEGORY_DISCOVERY_FAILED")
+            return
+
+        soup = BeautifulSoup(html, "lxml")
+        categories = {}
+
+        parents = soup.find_all("li", class_="rootverticalnav nav-1 category-item")
+
+        for parent in parents:
+            items = parent.find_all("div", class_="grid-item-6 clearfix")
+
+            for item in items:
+                a = item.find("a", href=True)
+                if not a:
+                    continue
+
+                name = " ".join(a.text.split())
+                url = a["href"]
+
+                if url.startswith("/"):
+                    url = self.BASE_URL + url.lstrip("/")
+
+                categories[name] = url
+
+        if not categories:
+            logger.warning(f"{self.name} | NO_CATEGORIES_FOUND")
+            return
+
+        os.makedirs("config", exist_ok=True)
+
+        with open("config/mytekcategories.py", "w", encoding="utf-8") as f:
+            f.write("CATEGORIES = {\n")
+            for k, v in categories.items():
+                f.write(f'    "{k}": "{v}",\n')
+            f.write("}\n")
+
+        logger.info(f"{self.name} | CATEGORY_DISCOVERY_DONE | {len(categories)}")
+        log_global(f"{self.name} | CATEGORY_DISCOVERY_DONE | {len(categories)}")
+
+    # =====================================================
+    # DUPLICATE HANDLER
+    # =====================================================
+    
+    def handle_duplicate(self, product_id, source, seen_products):
+        with self.lock:
+            if product_id in seen_products:
+                dup_logger.warning(
+                    f"{self.name} | DUPLICATE | id={product_id} | source={source}"
+                )
+                return True
+
+            seen_products[product_id] = source
             return False
 
     # =====================================================
-    # TRANSFORM PRODUCT
+    # SEARCH - Using SmartRequester
     # =====================================================
     
-    def transform_product(self, p, brand_map, category_map):
-        try:
-            product_id = p.get("id")
-            name = p.get("name")
+    def search(self, query):
+        logger.info(f"{self.name} | SEARCH_START | {query}")
 
-            if not product_id or not name:
-                return None
+        page = 1
+        results = []
+        seen_ids = set()
 
-            # URL
-            slug = p.get("slug")
-            url = f"https://skymil-shop.com/produit/{slug}"
+        while True:
+            url = f"{self.BASE_URL}myteksearch/index/productsearch/?q={query}&p={page}"
 
-            # ---------------------------------
-            # INIT PRODUCT SCHEMA
-            # ---------------------------------
-            product = create_product_schema(
-                self.name,
-                url,
-                product_id
-            )
+            # Use SmartRequester instead of get()
+            html = self.requester.get_html(url)
 
-            # ---------------------------------
-            # BASIC FIELDS
-            # ---------------------------------
-            product["name"] = name
+            if not html:
+                logger.warning(f"{self.name} | SEARCH_EMPTY_HTML | page={page}")
+                break
 
-            # ---------------------------------
-            # PRICE LOGIC
-            # ---------------------------------
-            price = p.get("price", 0)
-            old_price = p.get("old_price")
+            products = parse_mytek_products(html, self.name)
 
-            if old_price and old_price > price:
-                product["price"] = old_price
-                product["discount_price"] = price
-                product["discount_amount"] = round(old_price - price, 2)
-            else:
-                product["price"] = price
-                product["discount_price"] = 0
-                product["discount_amount"] = 0
+            if not products:
+                logger.info(
+                    f"{self.name} | SEARCH_NO_PRODUCTS | page={page} → stopping"
+                )
+                break
 
-            # ---------------------------------
-            # BRAND / CATEGORY
-            # ---------------------------------
-            product["brand"] = brand_map.get(p.get("brand_id"), "Unknown")
-            product["category"] = category_map.get(p.get("category_id"), "Unknown")
+            first_id = products[0].get("main_product_id")
 
-            # ---------------------------------
-            # IMAGES
-            # ---------------------------------
-            main_image = p.get("image_url")
-            images = p.get("images", [])
+            if first_id in seen_ids:
+                logger.warning(
+                    f"{self.name} | SEARCH_FALLBACK | page={page}"
+                )
+                break
 
-            all_images = []
+            for p in products:
+                seen_ids.add(p.get("main_product_id"))
 
-            if main_image:
-                all_images.append(main_image)
+            results.extend(products)
 
-            if images:
-                all_images.extend(images)
+            page += 1
 
-            product["images"] = all_images
-            product["main_image"] = main_image
+        logger.info(
+            f"{self.name} | SEARCH_DONE | {query} | total={len(results)}"
+        )
 
-            # ---------------------------------
-            # DESCRIPTION
-            # ---------------------------------
-            product["description"] = p.get("description", "")
+        return {
+            "site": self.name,
+            "query": query,
+            "total_results": len(results),
+            "products": results
+        }
 
-            # ---------------------------------
-            # SHORT DESCRIPTION (DICT FORMAT)
-            # ---------------------------------
-            specs = p.get("specs", {})
+    # =====================================================
+    # PRODUCT PARSER - Using SmartRequester
+    # =====================================================
+    
+    def parse_product(self, url, source, product_id=None):
+        # Use SmartRequester instead of get()
+        html = self.requester.get_html(url)
 
-            clean_specs = {}
-            seen_keys = set()
-
-            for k, v in specs.items():
-                if not k or not v:
-                    continue
-
-                key = str(k).strip().lower()
-                value = str(v).strip()
-
-                if key in seen_keys:
-                    continue
-
-                seen_keys.add(key)
-
-                clean_specs[key] = value
-
-            product["short_description"] = clean_specs
-
-            # ---------------------------------
-            # AVAILABILITY
-            # ---------------------------------
-            product["availability"] = (
-                "InStock" if p.get("in_stock") else "OutOfStock"
-            )
-            
-            # ---------------------------------
-            # SKU | Special ID
-            # ---------------------------------
-            product["special_id"] = p.get("reference")
-
-            return product
-
-        except Exception as e:
-            logger.error(f"{self.name} | TRANSFORM_ERROR | {e}")
+        if not html:
             return None
 
+        return parse_mytek_product_page(html, url, self.name, source, product_id)
+
     # =====================================================
-    # PROCESS SINGLE PRODUCT
+    # PRODUCT WORKER - Redis/PostgreSQL only (no file skip)
     # =====================================================
     
-    def process_product(self, product_data: Dict) -> Optional[Dict]:
-        """Process single product - ONLY add if NEW, skip if exists"""
-        try:
-            if product_data is None:
-                logger.warning(f"{self.name} | SKIP_NONE")
-                with self.lock:
-                    self.stats["errors"] += 1
-                return None
-            
-            if not isinstance(product_data, dict):
-                logger.warning(f"{self.name} | SKIP_INVALID")
-                with self.lock:
-                    self.stats["errors"] += 1
-                return None
-            
-            product_id = product_data.get("main_product_id")
-            
-            if not product_id:
-                logger.warning(f"{self.name} | SKIP_NO_ID")
-                with self.lock:
-                    self.stats["errors"] += 1
-                return None
-            
-            product_id = str(product_id)
-            
-            # Check duplicates within session
+    def scrape_product_worker(self, product, seen_products, source):
+        pid = product.get("main_product_id")
+        url = product.get("product_link")
+
+        if not pid or not url:
+            return None
+
+        # =====================================================
+        # CHECK 1: Duplicate in current session
+        # =====================================================
+        if self.handle_duplicate(pid, source, seen_products):
             with self.lock:
-                if product_id in self.seen_products:
-                    self.stats["skipped_duplicates"] += 1
-                    return None
-                self.seen_products.add(product_id)
-            
-            # =====================================================
-            # CHECK REDIS FIRST (FAST CACHE)
-            # =====================================================
-            if self.cache:
-                cached = self.cache.get_product(self.name.lower(), product_id)
-                if cached:
+                self.stats["skipped_duplicates"] += 1
+                if hasattr(self, '_update_stats'):
+                    self._update_stats(self.stats)
+            return None
+
+        # =====================================================
+        # CHECK 2: Product already exists in Redis/PostgreSQL
+        # =====================================================
+        if self._product_exists(pid):
+            with self.lock:
+                self.stats["skipped_duplicates"] += 1
+                if hasattr(self, '_update_stats'):
+                    self._update_stats(self.stats)
+            logger.debug(f"{self.name} | SKIP_EXISTING_DB | {pid}")
+            return None
+
+        try:
+            result = self.parse_product(url, source, pid)
+
+            if result:
+                # =====================================================
+                # SAVE: Use parent's _save_new_product for Redis + Batching
+                # =====================================================
+                if super()._save_new_product(result, pid):
+                    self.performance.add_product()
+                    self.total_products += 1
+                    
+                    # Update stats for dashboard
+                    self.stats["new_products"] = self.total_products
+                    self.stats["total_products_found"] = self.total_products
+                    
+                    if hasattr(self, '_update_stats'):
+                        self._update_stats(self.stats)
+                    
+                    # Also write to results file for backup
+                    write_product_result(result, self.name)
+                    
+                    logger.info(f"{self.name} | PRODUCT_SAVED | {pid}")
+                    return result
+                else:
+                    logger.warning(f"{self.name} | SAVE_FAILED | {pid}")
                     with self.lock:
-                        self.stats["skipped_duplicates"] += 1
+                        self.stats["errors"] += 1
+                        if hasattr(self, '_update_stats'):
+                            self._update_stats(self.stats)
+                    self._add_error(f"Save failed: {pid}")
                     return None
-            
-            # =====================================================
-            # CHECK POSTGRESQL (FALLBACK)
-            # =====================================================
-            if self.db:
-                existing = self.db.get_product_by_site_and_main_id(self.name.lower(), product_id)
-                if existing:
-                    with self.lock:
-                        self.stats["skipped_duplicates"] += 1
-                    return None
-            
-            # Save new product
-            if self._save_new_product(product_data, product_id):
-                return product_data
-            else:
-                with self.lock:
-                    self.stats["errors"] += 1
-                return None
-            
+
+            return None
+
         except Exception as e:
-            logger.error(f"{self.name} | PRODUCT_ERROR | {e}")
+            logger.error(f"{self.name} | WORKER_ERROR | {url} | {e}")
             with self.lock:
                 self.stats["errors"] += 1
+                if hasattr(self, '_update_stats'):
+                    self._update_stats(self.stats)
+            self._add_error(f"Worker error: {str(e)[:50]}")
             return None
 
     # =====================================================
-    # MAIN SCRAPER (TRANSFORMER)
+    # CATEGORY SCRAPER - Using SmartRequester
     # =====================================================
 
+    def scrape_category(self, category_name, category_url, seen_products):
+        logger.info(f"{self.name} | CATEGORY_START | {category_name}")
+        
+        self.stats['current_category'] = category_name
+        
+        results = []
+        seen_ids = set()
+        
+        # Use SmartRequester instead of get()
+        first_html = self.requester.get_html(category_url)
+        if not first_html:
+            self._add_error(f"No first page: {category_name}")
+            return results
+        
+        total_pages = self.get_category_page_count(first_html)
+        
+        self.stats['total_pages'] = total_pages
+        self.stats['current_page'] = 0
+        
+        if hasattr(self, '_update_stats'):
+            self._update_stats(self.stats)
+        
+        for page in range(1, total_pages + 1):
+            if '?' in category_url:
+                url = f"{category_url}&p={page}"
+            else:
+                url = f"{category_url}?p={page}"
+            
+            # Use SmartRequester instead of get()
+            html = self.requester.get_html(url)
+            
+            self.stats['current_page'] = page
+            self.stats['current_product'] = f"Page {page}/{total_pages}"
+            
+            if hasattr(self, '_update_stats'):
+                self._update_stats(self.stats)
+            
+            if not html:
+                self._add_error(f"Page {page} empty: {category_name}")
+                continue
+            
+            try:
+                products = parse_mytek_products(html, self.name)
+            except Exception as e:
+                logger.error(f"{self.name} | PARSE_ERROR | {category_name} | page={page} | {e}")
+                self._add_error(f"Parse error {category_name}: {str(e)[:50]}")
+                continue
+            
+            if not products:
+                continue
+            
+            first_id = products[0].get("main_product_id")
+            if first_id in seen_ids:
+                break
+            
+            for p in products:
+                seen_ids.add(p.get("main_product_id"))
+            
+            # =====================================================
+            # REMOVED: File-based existing_ids filter
+            # All deduplication is now handled by Redis/PostgreSQL
+            # =====================================================
+            
+            if not products:
+                continue
+            
+            with ThreadPoolExecutor(max_workers=20) as executor:
+                futures = [
+                    executor.submit(
+                        self.scrape_product_worker,
+                        p,
+                        seen_products,
+                        category_name
+                    )
+                    for p in products
+                ]
+                
+                for future in as_completed(futures):
+                    try:
+                        result = future.result(timeout=60)
+                        if result:
+                            results.append(result)
+                            self.performance.add_product()
+                    except Exception as e:
+                        logger.error(f"{self.name} | FUTURE_ERROR | {e}")
+                        with self.lock:
+                            self.stats["errors"] += 1
+                            if hasattr(self, '_update_stats'):
+                                self._update_stats(self.stats)
+                        self._add_error(f"Future error: {str(e)[:50]}")
+            
+            # Update batch status after each page
+            batch_size = self.get_pending_batch_size()
+            if batch_size > 0:
+                logger.info(f"{self.name} | PAGE_BATCH | {category_name} | page={page} | batch={batch_size}")
+            
+            self.stats['completed_categories'] = page
+            if hasattr(self, '_update_stats'):
+                self._update_stats(self.stats)
+        
+        return results
+
+    # =====================================================
+    # BRAND SCRAPER
+    # =====================================================
+    
+    def scrape_brands(self, seen_products):
+        logger.info(f"{self.name} | BRAND_START")
+        results = []
+
+        for brand in SEARCH_BRANDS:
+            try:
+                logger.info(f"{self.name} | BRAND_START | {brand}")
+
+                products = self.search(brand)["products"]
+
+                if not products:
+                    logger.info(f"{self.name} | BRAND_EMPTY | {brand}")
+                    continue
+
+                # =====================================================
+                # REMOVED: File-based existing_ids filter
+                # All deduplication is now handled by Redis/PostgreSQL
+                # =====================================================
+
+                tasks = [
+                    (self.scrape_product_worker, p, seen_products, brand)
+                    for p in products
+                ]
+
+                brand_results = self.thread_manager.run_tasks(
+                    tasks,
+                    desc=f"{self.name} | BRAND | {brand}"
+                )
+
+                results.extend(brand_results)
+
+                logger.info(
+                    f"{self.name} | BRAND_DONE | {brand} | collected={len(brand_results)}"
+                )
+            except Exception as e:
+                logger.error(f"{self.name} | BRAND_ERROR | {brand} | {e}")
+                self._add_error(f"Brand {brand} failed: {str(e)[:50]}")
+
+        logger.info(f"{self.name} | BRAND_DONE | total={len(results)}")
+        return results
+
+    # =====================================================
+    # FULL SCRAPER
+    # =====================================================
 
     def scrape_site(self):
         logger.info(f"{self.name} | SCRAPE_START")
         log_global(f"{self.name} | SCRAPE_START")
-        
+
+        self.start_time = time.time()
         results = []
+        seen_products = {}
         
+        total_categories = len(CATEGORIES)
+
+        # =====================================================
+        # RESET DASHBOARD STATS FOR NEW SCRAPE CYCLE
+        # =====================================================
         try:
-            self._init_connections()
+            from scraping.engine.multi_scrape_progress import get_multi_scrape_progress
+            progress = get_multi_scrape_progress()
+            progress.reset_site(self.name)
+            logger.info(f"{self.name} | DASHBOARD_RESET | new cycle")
         except Exception as e:
-            logger.error(f"{self.name} | CONNECTION_FAILED | {e}")
-            return {"site": self.name, "total_products": 0, "products": [], "stats": self.stats}
+            logger.debug(f"{self.name} | DASHBOARD_RESET_ERROR | {e}")
         
+        self.stats = {
+            "new_products": 0,
+            "skipped_duplicates": 0,
+            "errors": 0,
+            "redis_saved": 0,
+            "postgres_saved": 0,
+            "total_products_found": 0,
+            "completed_categories": 0,
+            "total_categories": total_categories,
+            "current_category": "",
+            "current_product": "",
+            "current_page": 0,
+            "total_pages": 0,
+            "category_progress": 0
+        }
+        
+        logger.info(f"{self.name} | STARTING | total_categories={total_categories}")
+        
+        if hasattr(self, '_update_stats'):
+            self._update_stats(self.stats)
+
         try:
-            products, brand_map, category_map = self.load_data()
-            
-            total_products = len(products)
-            self.stats = {
-                "new_products": 0,
-                "skipped_duplicates": 0,
-                "errors": 0,
-                "redis_saved": 0,
-                "postgres_saved": 0,
-                "total_products_found": total_products,
-                "completed_categories": 1,
-                "total_categories": 1,
-                "current_category": "Processing Skymil products",
-                "current_product": "",
-                "current_page": 0,
-                "total_pages": 1,
-                "category_progress": 0
-            }
-            self.seen_products.clear()
-            
-            logger.info(f"{self.name} | STARTING | total_products={total_products}")
-            
-            # Initial stats update
-            if hasattr(self, '_update_stats'):
-                self._update_stats(self.stats)
-            
-            for i, p in enumerate(products):
-                product_id = str(p.get("id"))
-                
-                # Update product progress
-                self.stats['current_product'] = f"{i+1}/{total_products}"
+            for i, (name, url) in enumerate(CATEGORIES.items(), start=1):
+                self.stats['current_category'] = name
                 if hasattr(self, '_update_stats'):
                     self._update_stats(self.stats)
                 
-                # =====================================================
-                # CHECK REDIS FIRST (FAST CACHE)
-                # =====================================================
-                if self.cache:
-                    cached = self.cache.get_product(self.name.lower(), product_id)
-                    if cached:
-                        # Product exists in Redis, skip it
-                        with self.lock:
-                            self.stats["skipped_duplicates"] += 1
-                        continue
-                
-                # =====================================================
-                # CHECK POSTGRESQL (FALLBACK)
-                # =====================================================
-                if self.db:
-                    existing = self.db.get_product_by_site_and_main_id(self.name.lower(), product_id)
-                    if existing:
-                        # Product exists in PostgreSQL, skip it
-                        with self.lock:
-                            self.stats["skipped_duplicates"] += 1
-                        continue
-                
-                # Validate product
-                if not p.get("name"):
+                try:
+                    res = self.scrape_category(name, url, seen_products)
+                    results.extend(res)
+                except Exception as e:
+                    error_msg = f"Category '{name}' failed: {str(e)[:50]}"
+                    logger.error(f"{self.name} | CATEGORY_ERROR | {name} | {e}")
+                    self._add_error(error_msg)
                     continue
                 
-                if p.get("price", 0) <= 0:
-                    continue
+                self.stats['completed_categories'] = i
+                self.stats['category_progress'] = (i / total_categories) * 100
                 
-                # Transform product
-                product = self.transform_product(p, brand_map, category_map)
-                
-                if not product:
-                    continue
-                
-                # Set main_product_id for saving
-                product['main_product_id'] = product_id
-                
-                # Process and save the product
-                saved_product = self.process_product(product)
-                if saved_product:
-                    results.append(saved_product)
-                    self.performance.add_product()
-                
-                # Update new products count
-                self.stats['new_products'] = len(results)
                 if hasattr(self, '_update_stats'):
                     self._update_stats(self.stats)
                 
-                if self.performance.total_products % 50 == 0:
-                    speed = self.performance.get_speed()
-                    logger.info(f"{self.name} | PROGRESS | {self.performance.total_products}/{total_products} | speed={speed:.2f} prod/s")
+                batch_size = self.get_pending_batch_size()
+                logger.info(f"Progress: {i}/{total_categories} categories completed | new_products={len(results)} | batch={batch_size} | skipped={self.stats['skipped_duplicates']}")
+
+            try:
+                brand_results = self.scrape_brands(seen_products)
+                results.extend(brand_results)
+            except Exception as e:
+                error_msg = f"Brands fallback failed: {str(e)[:50]}"
+                logger.error(f"{self.name} | BRANDS_ERROR | {e}")
+                self._add_error(error_msg)
+
+            self.stats['completed_categories'] = total_categories
+            self.stats['category_progress'] = 100
             
-            # Complete all categories
-            self.stats['completed_categories'] = 1
             if hasattr(self, '_update_stats'):
                 self._update_stats(self.stats)
-            
+
+        except KeyboardInterrupt:
+            logger.warning(f"{self.name} | INTERRUPTED")
+            try:
+                from scraping.engine.multi_scrape_progress import get_multi_scrape_progress
+                progress = get_multi_scrape_progress()
+                progress.set_status(self.name, "⚠️ Interrupted")
+            except:
+                pass
         except Exception as e:
+            error_msg = f"Scrape failed: {str(e)[:50]}"
             logger.error(f"{self.name} | SCRAPE_ERROR | {e}")
             import traceback
             traceback.print_exc()
+            self._add_error(error_msg)
         finally:
+            # =====================================================
+            # FLUSH ANY REMAINING PRODUCTS
+            # =====================================================
+            batch_size = self.get_pending_batch_size()
+            if batch_size > 0:
+                logger.info(f"{self.name} | FLUSHING_PENDING | {batch_size} products")
+                try:
+                    self.flush_pending_batch()
+                except Exception as e:
+                    error_msg = f"Flush failed: {str(e)[:50]}"
+                    logger.error(f"{self.name} | FLUSH_ERROR | {e}")
+                    self._add_error(error_msg)
+            
+            # Log final summary
+            self.log_final_summary(results)
+            
             self._close_connections()
-        
+
         logger.info(f"{self.name} | SCRAPE_DONE | total={len(results)}")
         log_global(f"{self.name} | SCRAPE_DONE | total={len(results)}")
-        
+
         print("\n==============================")
         print(f" {self.name} SCRAPING DONE")
         print(f" TOTAL PRODUCTS: {len(results)}")
@@ -529,32 +571,48 @@ class SkymilSite(BaseSite):
         print(f" POSTGRES SAVED: {self.stats['postgres_saved']}")
         print(f" ERRORS: {self.stats['errors']}")
         print("==============================\n")
-        
+
         return {
             "site": self.name,
             "total_products": len(results),
             "products": results,
             "stats": self.stats
         }
+
+    # =====================================================
+    # PAGINATION DETECTION
+    # =====================================================
     
-    def search(self, query):
-        log_global(f"{self.name} | FEATURE_NOT_IMPLEMENTED | Yet !")
-        logger.warning(f"{self.name} | FEATURE_NOT_IMPLEMENTED | Yet !")
-        print(f"\n {self.name} | FEATURE_NOT_IMPLEMENTED | Yet ! \n")
-        return
-    
-    def parse_product(self, url, product_id):
-        log_global(f"{self.name} | FEATURE_NOT_IMPLEMENTED | Yet !")
-        logger.warning(f"{self.name} | FEATURE_NOT_IMPLEMENTED | Yet !")
-        print(f"\n {self.name} | FEATURE_NOT_IMPLEMENTED | Yet ! \n")
-        return
-    
-    def extract_categories(self):
-        log_global(f"{self.name} | FEATURE_NOT_IMPLEMENTED | Yet !")
-        logger.warning(f"{self.name} | FEATURE_NOT_IMPLEMENTED | Yet !")
-        print(f"\n {self.name} | FEATURE_NOT_IMPLEMENTED | Yet ! \n")
-        return
+    def get_category_page_count(self, html):
+        soup = BeautifulSoup(html, "lxml")
+        
+        pages = soup.select(".pagination li a")
+        nums = []
+        
+        for p in pages:
+            try:
+                text = p.text.strip()
+                if text.isdigit():
+                    nums.append(int(text))
+            except:
+                continue
+        
+        if nums:
+            return max(nums)
+        
+        pages = soup.select(".page-list li a")
+        nums = []
+        
+        for p in pages:
+            try:
+                text = p.text.strip()
+                if text.isdigit():
+                    nums.append(int(text))
+            except:
+                continue
+        
+        return max(nums) if nums else 1
 
 
-def create_skymil_site() -> SkymilSite:
-    return SkymilSite()
+def create_mytek_site() -> MytekSite:
+    return MytekSite()

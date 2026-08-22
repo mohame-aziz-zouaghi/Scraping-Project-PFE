@@ -30,6 +30,7 @@ class SmartRequester:
     - Connection pooling
     - Request queuing
     - Site-specific configuration
+    - Option to use basic headers (for sites that reject modern headers)
     """
     
     # Site-specific default configurations
@@ -43,6 +44,7 @@ class SmartRequester:
             "verify_ssl": True,
             "delay_between_requests": (0.3, 1.5),
             "respect_robots": True,
+            "use_basic_headers": False,
         },
         "tunisianet": {
             "requests_per_minute": 10,
@@ -53,6 +55,7 @@ class SmartRequester:
             "verify_ssl": True,
             "delay_between_requests": (0.5, 2.0),
             "respect_robots": True,
+            "use_basic_headers": False,
         },
         "mytek": {
             "requests_per_minute": 12,
@@ -63,6 +66,18 @@ class SmartRequester:
             "verify_ssl": True,
             "delay_between_requests": (0.3, 1.5),
             "respect_robots": True,
+            "use_basic_headers": True,  # Mytek works better with basic headers
+        },
+        "spacenet": {
+            "requests_per_minute": 20,
+            "max_retries": 4,
+            "timeout": 45,
+            "use_referer": True,
+            "use_session": True,
+            "verify_ssl": True,
+            "delay_between_requests": (0.5, 2.0),
+            "respect_robots": True,
+            "use_basic_headers": True,  # Spacenet works better with basic headers
         },
         "default": {
             "requests_per_minute": 15,
@@ -73,6 +88,7 @@ class SmartRequester:
             "verify_ssl": True,
             "delay_between_requests": (0.3, 1.5),
             "respect_robots": True,
+            "use_basic_headers": False,
         }
     }
     
@@ -89,6 +105,7 @@ class SmartRequester:
         respect_robots: bool = True,
         custom_headers: Optional[Dict[str, str]] = None,
         proxy_config: Optional[Dict[str, str]] = None,
+        use_basic_headers: Optional[bool] = None,
     ):
         """
         Initialize the SmartRequester with site-specific or custom configuration
@@ -105,6 +122,7 @@ class SmartRequester:
             respect_robots: Respect robots.txt
             custom_headers: Custom headers to add
             proxy_config: Proxy configuration
+            use_basic_headers: If True, send only essential headers (for sites that reject modern headers)
         """
         self.site_name = site_name.lower()
         
@@ -112,9 +130,9 @@ class SmartRequester:
         site_config = self.SITE_CONFIGS.get(self.site_name, self.SITE_CONFIGS["default"])
         
         # Apply config with overrides
-        self.requests_per_minute = requests_per_minute or site_config.get("requests_per_minute", 15)
-        self.max_retries = max_retries or site_config.get("max_retries", 3)
-        self.timeout = timeout or site_config.get("timeout", 30)
+        self.requests_per_minute = requests_per_minute if requests_per_minute is not None else site_config.get("requests_per_minute", 15)
+        self.max_retries = max_retries if max_retries is not None else site_config.get("max_retries", 3)
+        self.timeout = timeout if timeout is not None else site_config.get("timeout", 30)
         self.use_session = use_session if use_session is not None else site_config.get("use_session", True)
         self.use_referer = use_referer if use_referer is not None else site_config.get("use_referer", True)
         self.verify_ssl = verify_ssl if verify_ssl is not None else site_config.get("verify_ssl", True)
@@ -122,6 +140,7 @@ class SmartRequester:
         self.respect_robots = respect_robots
         self.custom_headers = custom_headers or {}
         self.proxy_config = proxy_config
+        self.use_basic_headers = use_basic_headers if use_basic_headers is not None else site_config.get("use_basic_headers", False)
         
         # Session management
         self.session = None
@@ -154,7 +173,7 @@ class SmartRequester:
         # Initialize with a random browser fingerprint
         self._browser_fingerprint = self._generate_fingerprint()
         
-        logger.info(f"SmartRequester initialized for: {self.site_name}")
+        logger.info(f"SmartRequester initialized for: {self.site_name} (basic_headers={self.use_basic_headers})")
         logger.debug(f"Config: RPM={self.requests_per_minute}, Retries={self.max_retries}, Timeout={self.timeout}s")
     
     def _init_session(self):
@@ -202,9 +221,34 @@ class SmartRequester:
         extra_headers: Dict[str, str] = None
     ) -> Dict[str, str]:
         """
-        Generate request-specific headers with rotation
+        Generate request-specific headers with rotation.
+        If use_basic_headers is True, sends only essential headers.
         """
         headers = {}
+        
+        if self.use_basic_headers:
+            # =====================================================
+            # BASIC HEADERS - For sites that reject modern headers
+            # =====================================================
+            headers = {
+                'User-Agent': get_random_user_agent(),
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+                'Accept-Language': get_random_accept_language(),
+                'Accept-Encoding': 'gzip, deflate',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1',
+            }
+            if use_referer:
+                headers['Referer'] = random.choice(self._get_referers())
+            if content_type:
+                headers['Content-Type'] = content_type
+            if extra_headers:
+                headers.update(extra_headers)
+            return headers
+        
+        # =====================================================
+        # ADVANCED HEADERS - For modern sites with anti-bot protection
+        # =====================================================
         
         # Start with session headers if available
         if self.session:
@@ -333,11 +377,12 @@ class SmartRequester:
     
     def _process_response(self, response: requests.Response, url: str) -> Tuple[Optional[str], Optional[Dict], Optional[Dict]]:
         """
-        Process response and handle different content types
+        Process response and handle different content types including compressed data.
         Returns: (html_content, json_data, error_info)
         """
         try:
             content_type = response.headers.get('Content-Type', '').lower()
+            content_encoding = response.headers.get('Content-Encoding', '').lower()
             error_info = None
             
             # Check for error responses
@@ -345,23 +390,84 @@ class SmartRequester:
                 error_info = {
                     "status_code": response.status_code,
                     "content_type": content_type,
+                    "content_encoding": content_encoding,
                     "message": response.text[:200] if response.text else "No content"
                 }
+            
+            # =====================================================
+            # Handle compressed content
+            # =====================================================
+            
+            # Try to get the content as text (requests handles decompression automatically)
+            try:
+                # First try to get the text (requests usually handles gzip/deflate)
+                text_content = response.text
+                
+                # Check if the text is still garbled (contains binary data)
+                if text_content and (len(text_content) > 0 and ord(text_content[0]) > 127):
+                    # Text is probably still compressed, try to decode manually
+                    try:
+                        import zlib
+                        import gzip
+                        import io
+                        
+                        # If content is gzipped
+                        if 'gzip' in content_encoding or response.raw.headers.get('Content-Encoding') == 'gzip':
+                            gzip_file = gzip.GzipFile(fileobj=io.BytesIO(response.content))
+                            text_content = gzip_file.read().decode('utf-8', errors='ignore')
+                        # Try deflate
+                        elif 'deflate' in content_encoding:
+                            text_content = zlib.decompress(response.content, -zlib.MAX_WBITS).decode('utf-8', errors='ignore')
+                        # Try raw zlib
+                        else:
+                            try:
+                                text_content = zlib.decompress(response.content, 16 + zlib.MAX_WBITS).decode('utf-8', errors='ignore')
+                            except:
+                                text_content = response.content.decode('utf-8', errors='ignore')
+                    except Exception as e:
+                        logger.debug(f"Decompression attempt failed: {e}")
+                        # Last resort: decode with errors ignored
+                        try:
+                            text_content = response.content.decode('utf-8', errors='ignore')
+                        except:
+                            text_content = ""
+                
+                # If text is still empty or invalid, use content decoding
+                if not text_content or len(text_content.strip()) < 10:
+                    try:
+                        text_content = response.content.decode('utf-8', errors='ignore')
+                    except:
+                        text_content = ""
+                        
+            except Exception as e:
+                logger.warning(f"Failed to decode response: {e}")
+                text_content = ""
+            
+            # Check if we got valid HTML
+            if text_content and (text_content.strip().startswith('<!DOCTYPE') or text_content.strip().startswith('<html')):
+                logger.debug(f"Valid HTML received ({len(text_content)} chars)")
+            elif text_content and len(text_content) > 10:
+                logger.debug(f"Received content ({len(text_content)} chars), first 100 chars: {text_content[:100]}")
+            else:
+                logger.warning(f"Empty or invalid content from {url}")
             
             # JSON response
             if 'application/json' in content_type or url.endswith('.json'):
                 try:
-                    return None, response.json(), error_info
+                    if text_content:
+                        return None, json.loads(text_content), error_info
+                    else:
+                        return None, response.json(), error_info
                 except json.JSONDecodeError:
                     logger.warning(f"Invalid JSON response from {url}")
-                    return None, None, {"error": "invalid_json", "content": response.text[:100]}
+                    return None, None, {"error": "invalid_json", "content": text_content[:100] if text_content else ""}
             
             # HTML response
-            if 'text/html' in content_type:
-                return response.text, None, error_info
+            if 'text/html' in content_type or (text_content and (text_content.strip().startswith('<!DOCTYPE') or text_content.strip().startswith('<html'))):
+                return text_content, None, error_info
             
             # Raw text
-            return response.text, None, error_info
+            return text_content, None, error_info
             
         except Exception as e:
             logger.error(f"Error processing response: {e}")
@@ -369,6 +475,14 @@ class SmartRequester:
     
     def _make_request(self, method: str, **kwargs) -> requests.Response:
         """Make the actual request using session or direct"""
+        # Add Accept-Encoding header to handle compression if not already present
+        if 'headers' not in kwargs:
+            kwargs['headers'] = {}
+        if 'Accept-Encoding' not in kwargs['headers']:
+            kwargs['headers']['Accept-Encoding'] = 'gzip, deflate'
+        if self.session and 'Accept-Encoding' not in self.session.headers:
+            self.session.headers['Accept-Encoding'] = 'gzip, deflate'
+        
         if self.use_session and self.session:
             with self.session_lock:
                 return self.session.request(method, **kwargs)
@@ -678,7 +792,8 @@ def get_megapc_requester() -> SmartRequester:
         timeout=30,
         use_session=True,
         use_referer=True,
-        delay_between_requests=(0.3, 1.5)
+        delay_between_requests=(0.3, 1.5),
+        use_basic_headers=False,
     )
 
 def get_tunisianet_requester() -> SmartRequester:
@@ -690,7 +805,8 @@ def get_tunisianet_requester() -> SmartRequester:
         timeout=45,
         use_session=True,
         use_referer=True,
-        delay_between_requests=(0.5, 2.0)
+        delay_between_requests=(0.5, 2.0),
+        use_basic_headers=False,
     )
 
 def get_mytek_requester() -> SmartRequester:
@@ -702,5 +818,19 @@ def get_mytek_requester() -> SmartRequester:
         timeout=30,
         use_session=True,
         use_referer=True,
-        delay_between_requests=(0.3, 1.5)
+        delay_between_requests=(0.3, 1.5),
+        use_basic_headers=True,  # Mytek works better with basic headers
+    )
+
+def get_spacenet_requester() -> SmartRequester:
+    """Get a pre-configured requester for Spacenet"""
+    return SmartRequester(
+        site_name="spacenet",
+        requests_per_minute=20,
+        max_retries=4,
+        timeout=45,
+        use_session=True,
+        use_referer=True,
+        delay_between_requests=(0.5, 2.0),
+        use_basic_headers=True,  # Spacenet works better with basic headers
     )

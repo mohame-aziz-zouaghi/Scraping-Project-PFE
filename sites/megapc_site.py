@@ -4,8 +4,7 @@ import time
 import threading
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any, Set, Tuple
+from typing import Dict, List, Optional, Any, Set
 from urllib.parse import quote
 from contextlib import contextmanager
 
@@ -13,16 +12,13 @@ import requests
 
 from core.utils.debug_logger import log_scrape_stats, end_session
 
-from Database.Redis.product_cache import ProductCache
 from core.Web.smart_requester import SmartRequester
 from core.utils.Dclean_html import clean_html
 from core.utils.build_id_manager import BuildIDManager, get_build_id_manager
 from core.utils.clean_parse_specs import parse_specs
-from core.utils.progress_bar import ProgressBar
 from core.logger import setup_logger, write_product_result, log_global
 from core.Web.product_schema import create_product_schema
 from core.performance import PerformanceTracker
-from Database.Postgresql.db import Database
 
 from parsers.megapc.megapc_products_parser import parse_megapc_products
 from parsers.megapc.megapc_product_details_parser import parse_megapc_product_details
@@ -39,11 +35,10 @@ class MegaPCSite(BaseSite):
     """MegaPC scraper - ONLY adds NEW products, skips existing ones"""
     
     def __init__(self):
-        # IMPORTANT: Call super().__init__() FIRST to initialize base class attributes
         super().__init__()
         
         self.name = "MEGAPC"
-        self.scrape_interval = 1800  # 30 minutes between scrapes
+        self.scrape_interval = 1800
         self.performance = PerformanceTracker()
         
         # API endpoints
@@ -57,8 +52,7 @@ class MegaPCSite(BaseSite):
         self._update_base_next_url()
 
         # SmartRequester for product details
-        self.requester = SmartRequester(
-            site_name="megapc",
+        self.set_requester_config(
             requests_per_minute=50,
             max_retries=3,
             timeout=30,
@@ -67,38 +61,38 @@ class MegaPCSite(BaseSite):
             delay_between_requests=(0.5, 1.5)
         )
         
-        # Stats tracking - update base class stats
-        self.stats = {
-            "new_products": 0,
-            "skipped_duplicates": 0,
-            "errors": 0,
-            "redis_saved": 0,
-            "postgres_saved": 0,
-            "total_products_found": 0,
-            "completed_categories": 0,
-            "total_categories": 0,
-            "current_category": "",
-            "current_product": "",
-            "current_page": 0,
-            "total_pages": 0,
-            "category_progress": 0
-        }
-
-        # Thread safety
         self.lock = threading.Lock()
         self.seen_products: Set[str] = set()
         
-        # Connections
-        self.cache = None
-        self.db = None
-        self.redis_client = None
+        # Batch size for this site
+        self.batch_size = 50
         
         # Test mode
         self.test_mode = False
         self.test_limit = 5
+
+
+    def get_requester_config(self) -> Dict:
+        return {
+            "requests_per_minute": 50,
+            "max_retries": 3,
+            "timeout": 30,
+            "use_session": True,
+            "use_referer": True,
+            "delay_between_requests": (0.5, 1.5),
+        }
     
+    def _add_error(self, error_msg: str):
+        """Helper method to add error to dashboard"""
+        try:
+            from scraping.engine.multi_scrape_progress import get_multi_scrape_progress
+            progress = get_multi_scrape_progress()
+            progress.increment_error(self.name, error_msg)
+        except Exception as e:
+            logger.debug(f"{self.name} | ERROR_DASHBOARD_FAILED | {e}")
+
     # =====================================================
-    # CONNECTION MANAGEMENT
+    # BUILD ID MANAGEMENT
     # =====================================================
     
     def _update_base_next_url(self) -> bool:
@@ -114,69 +108,26 @@ class MegaPCSite(BaseSite):
             logger.error("Failed to get build ID")
             return False
 
-    def _init_connections(self):
-        """Initialize database and cache connections"""
+    def _validate_build_id(self, build_id: str) -> bool:
+        """Validate a build ID by testing with a known endpoint"""
         try:
-            self.cache = ProductCache()
-            self.redis_client = self.cache.redis
-            logger.info(f"{self.name} | REDIS_CONNECTED")
+            test_url = f"{self.base_next_url}/{build_id}/shop/product/"
+            response = requests.head(test_url, timeout=10, allow_redirects=True)
+            
+            if response.status_code in [200, 404]:
+                logger.debug(f"Build ID {build_id} validated (status={response.status_code})")
+                return True
+            
+            logger.warning(f"Build ID {build_id} validation failed (status={response.status_code})")
+            return False
+            
+        except requests.RequestException as e:
+            logger.warning(f"Build ID validation error: {e}")
+            return False
         except Exception as e:
-            logger.error(f"{self.name} | REDIS_CONNECTION_ERROR | {e}")
-            raise
-        
-        try:
-            self.db = Database()
-            logger.info(f"{self.name} | POSTGRES_CONNECTED")
-        except Exception as e:
-            logger.error(f"{self.name} | POSTGRES_CONNECTION_ERROR | {e}")
-            raise
-    
-    def _close_connections(self):
-        """Close database and cache connections"""
-        try:
-            if self.db:
-                self.db.close()
-                logger.info(f"{self.name} | POSTGRES_CLOSED")
-        except Exception as e:
-            logger.error(f"{self.name} | POSTGRES_CLOSE_ERROR | {e}")
-        
-        try:
-            if self.cache and self.redis_client:
-                pass
-                logger.info(f"{self.name} | REDIS_CLOSED")
-        except Exception as e:
-            logger.error(f"{self.name} | REDIS_CLOSE_ERROR | {e}")
-    
-    @contextmanager
-    def _connections(self):
-        """Context manager for database connections"""
-        self._init_connections()
-        try:
-            yield
-        finally:
-            self._close_connections()
-    
-    # =====================================================
-    # JSON SERIALIZATION
-    # =====================================================
-    
-    def _make_json_serializable(self, obj: Any) -> Any:
-        """Convert non-serializable objects to JSON serializable format"""
-        if obj is None:
-            return None
-        if isinstance(obj, (str, int, float, bool)):
-            return obj
-        if isinstance(obj, dict):
-            return {k: self._make_json_serializable(v) for k, v in obj.items()}
-        if isinstance(obj, (list, tuple)):
-            return [self._make_json_serializable(item) for item in obj]
-        if hasattr(obj, 'isoformat'):
-            return obj.isoformat()
-        try:
-            return str(obj)
-        except:
-            return None
-    
+            logger.warning(f"Unexpected validation error: {e}")
+            return False
+
     # =====================================================
     # API PRODUCTS FETCH
     # =====================================================
@@ -201,12 +152,14 @@ class MegaPCSite(BaseSite):
             
             if response.status_code != 200:
                 logger.warning(f"{self.name} | API_FAIL | {category} > {subcategory} | status={response.status_code}")
+                self._add_error(f"API failed {category}: {response.status_code}")
                 return []
             
             try:
                 data = response.json()
             except Exception as e:
                 logger.error(f"{self.name} | INVALID_JSON | {category} > {subcategory} | {e}")
+                self._add_error(f"Invalid JSON: {str(e)[:50]}")
                 return []
             
             if not isinstance(data, dict):
@@ -224,9 +177,11 @@ class MegaPCSite(BaseSite):
             
         except requests.exceptions.Timeout:
             logger.error(f"{self.name} | API_TIMEOUT | {category} > {subcategory}")
+            self._add_error(f"API timeout: {category}")
             return []
         except Exception as e:
             logger.error(f"{self.name} | API_ERROR | {category} > {subcategory} | {e}")
+            self._add_error(f"API error: {str(e)[:50]}")
             return []
     
     # =====================================================
@@ -251,9 +206,8 @@ class MegaPCSite(BaseSite):
         
         url = f"{self.base_next}/shop/product/{cat_path}/{sub_path}/{slug}.json?lien={cat_param}&lien={sub_param}&lien={slug}"
         
-        # Retry configuration
-        max_retries = 2  # 404 (product removed)
-        max_server_retries = 3  # 500 errors
+        max_retries = 2
+        max_server_retries = 3
         
         for attempt in range(max_retries):
             try:
@@ -270,7 +224,6 @@ class MegaPCSite(BaseSite):
                 
                 status_code = metadata.get('status_code', 0)
                 
-                # 404 - Product removed
                 if status_code == 404:
                     failure_count = self.build_manager.record_failure()
                     logger.warning(f"Details 404 for {slug} (product removed) - attempt {attempt + 1}/{max_retries}")
@@ -283,7 +236,6 @@ class MegaPCSite(BaseSite):
                         logger.warning(f"Product {slug} confirmed removed (404 after {max_retries} attempts)")
                         return {}
                 
-                # 500 - Server error
                 elif status_code >= 500:
                     self.build_manager.record_failure()
                     logger.warning(f"Details {status_code} for {slug} (attempt {attempt + 1}/{max_server_retries})")
@@ -294,9 +246,9 @@ class MegaPCSite(BaseSite):
                         continue
                     else:
                         logger.error(f"Server error {status_code} for {slug} after {max_server_retries} attempts")
+                        self._add_error(f"Server error {status_code}: {slug}")
                         return {}
                 
-                # 403 - Blocked
                 elif status_code == 403:
                     self.build_manager.record_failure()
                     logger.warning(f"Details 403 (blocked) for {slug} (attempt {attempt + 1}/{max_retries})")
@@ -307,9 +259,9 @@ class MegaPCSite(BaseSite):
                         continue
                     else:
                         logger.warning(f"Product {slug} blocked (403) after {max_retries} attempts")
+                        self._add_error(f"Blocked (403): {slug}")
                         return {}
                 
-                # Other errors
                 else:
                     self.build_manager.record_failure()
                     logger.warning(f"Details failed for {slug}: status={status_code} (attempt {attempt + 1}/{max_retries})")
@@ -337,6 +289,7 @@ class MegaPCSite(BaseSite):
             except Exception as e:
                 self.build_manager.record_failure()
                 logger.error(f"Details error for {slug} (attempt {attempt + 1}/{max_retries}): {e}")
+                self._add_error(f"Details error {slug}: {str(e)[:50]}")
                 
                 if attempt < max_retries - 1:
                     wait_time = 2 ** attempt
@@ -348,7 +301,7 @@ class MegaPCSite(BaseSite):
         return {}
     
     # =====================================================
-    # PRODUCT BUILDING (NEW PRODUCTS ONLY)
+    # PRODUCT BUILDING
     # =====================================================
     
     def build_product(self, base: Dict, details: Dict, url: str) -> Optional[Dict]:
@@ -364,12 +317,10 @@ class MegaPCSite(BaseSite):
         
         product = create_product_schema(self.name, url, product_id)
         
-        # Basic info
         product["name"] = base.get("name")
         product["brand"] = base.get("brand")
         product["category"] = base.get("category")
         
-        # Price calculation
         price = base.get("price") or 0
         promo = base.get("promo_price") or 0
         
@@ -382,14 +333,10 @@ class MegaPCSite(BaseSite):
             product["discount_price"] = 0
             product["discount_amount"] = 0
         
-        # Availability
         stock = base.get("stock", 0)
         product["availability"] = "InStock" if stock > 0 else "OutOfStock"
         
-        # Special ID (SKU)
         product["special_id"] = details.get("sku")
-        
-        # Details
         product["description"] = clean_html(details.get("description", ""))
         product["short_description"] = parse_specs(details.get("short_description", []))
         
@@ -403,90 +350,7 @@ class MegaPCSite(BaseSite):
         return self._make_json_serializable(product)
     
     # =====================================================
-    # CHECK IF PRODUCT EXISTS (FOR NEW PRODUCTS ONLY)
-    # =====================================================
-    
-    def _product_exists(self, product_id: str) -> bool:
-        """Check if product already exists in Redis or PostgreSQL"""
-        # Check Redis first (fast)
-        if self.cache:
-            cached = self.cache.get_product(self.name.lower(), product_id)
-            if cached:
-                return True
-        
-        # Check PostgreSQL
-        if self.db:
-            existing = self.db.get_product_by_site_and_main_id(self.name.lower(), product_id)
-            if existing:
-                return True
-        
-        return False
-    
-    # =====================================================
-    # SAVE NEW PRODUCT ONLY
-    # =====================================================
-    
-    def _save_new_product(self, product: Dict, product_id: str) -> bool:
-        """Save ONLY new product to Redis cache and PostgreSQL (no updates)"""
-        try:
-            # Prepare cache payload
-            cache_payload = {
-                "url": str(product.get("url", "")),
-                "price": float(product.get("price", 0)),
-                "discount_price": float(product.get("discount_price", 0)),
-                "discount_amount": float(product.get("discount_amount", 0)),
-                "availability": str(product.get("availability", "OutOfStock")),
-                "special_id": str(product.get("special_id")) if product.get("special_id") else None,
-                "price_valid_until": str(product.get("price_valid_until")) if product.get("price_valid_until") else None,
-                "last_checked": int(time.time()),
-                "is_enabled": True
-            }
-            
-            # Save to Redis (no TTL)
-            if self.cache:
-                self.cache.set_product(self.name.lower(), product_id, cache_payload, ttl=None)
-                self.stats["redis_saved"] += 1
-            
-            # Save to PostgreSQL (INSERT only - not upsert)
-            if self.db:
-                db_product = {
-                    "site": self.name.lower(),
-                    "main_product_id": product_id,
-                    "special_id": product.get("special_id"),
-                    "url": product.get("url"),
-                    "name": product.get("name"),
-                    "price": float(product.get("price", 0)),
-                    "discount_price": float(product.get("discount_price", 0)),
-                    "discount_amount": float(product.get("discount_amount", 0)),
-                    "availability": product.get("availability", "OutOfStock"),
-                    "price_valid_until": product.get("price_valid_until"),
-                    "brand": product.get("brand"),
-                    "category": product.get("category"),
-                    "description": product.get("description", ""),
-                    "short_description": product.get("short_description", []),
-                    "images": product.get("images", []),
-                    "main_image": product.get("main_image"),
-                    "is_enabled": True
-                }
-                
-                # Convert any non-serializable items
-                db_product = self._make_json_serializable(db_product)
-                
-                # Use upsert (will insert if new, skip if exists)
-                self.db.upsert_products([db_product])
-                self.stats["postgres_saved"] += 1
-            
-            # Write to result file
-            write_product_result(product, self.name)
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"{self.name} | SAVE_ERROR | {product_id} | {e}")
-            return False
-    
-    # =====================================================
-    # PROCESS SINGLE PRODUCT (NEW PRODUCTS ONLY)
+    # PROCESS SINGLE PRODUCT
     # =====================================================
     
     def process_product(self, product_data: Dict, category: str, subcategory: str) -> Optional[Dict]:
@@ -499,9 +363,9 @@ class MegaPCSite(BaseSite):
                 logger.warning(f"{self.name} | SKIP_NO_ID | slug={slug}")
                 with self.lock:
                     self.stats["errors"] += 1
+                self._add_error(f"Product missing ID or slug")
                 return None
             
-            # Check for duplicates within this scrape session
             with self.lock:
                 if slug in self.seen_products:
                     dup_logger.warning(f"{self.name} | DUPLICATE | {slug}")
@@ -509,48 +373,43 @@ class MegaPCSite(BaseSite):
                     return None
                 self.seen_products.add(slug)
             
-            # =====================================================
-            # SKIP IF PRODUCT ALREADY EXISTS
-            # =====================================================
+            # Use inherited _product_exists from BaseSite
             if self._product_exists(product_id):
                 with self.lock:
                     self.stats["skipped_duplicates"] += 1
                 logger.debug(f"{self.name} | SKIP_EXISTING | {product_id} | {slug}")
                 return None
             
-            # Build URL
             url = f"https://megapc.tn/shop/product/{category}/{subcategory}/{slug}"
             
-            # Fetch details
             details = self.get_product_details(category, subcategory, slug)
             
-            # Skip if details fetch failed
             if not details or not details.get("sku"):
                 logger.warning(f"{self.name} | SKIP_NO_DETAILS | {product_id} | {slug} | Details fetch failed")
                 with self.lock:
                     self.stats["errors"] += 1
+                self._add_error(f"No details for {product_id}")
                 return None
 
-            # Build product
             final_product = self.build_product(product_data, details, url)
             
             if not final_product:
                 with self.lock:
                     self.stats["errors"] += 1
+                self._add_error(f"Build failed for {product_id}")
                 return None
             
-            # =====================================================
-            # NEW PRODUCT - SAVE IT
-            # =====================================================
             logger.info(f"{self.name} | NEW_PRODUCT | {product_id} | {slug}")
             final_product['is_new'] = True
             
-            if self._save_new_product(final_product, product_id):
+            # USE PARENT'S _save_new_product (which uses batching)
+            if super()._save_new_product(final_product, product_id):
                 with self.lock:
                     self.stats["new_products"] += 1
             else:
                 with self.lock:
                     self.stats["errors"] += 1
+                self._add_error(f"Save failed for {product_id}")
             
             return final_product
             
@@ -558,8 +417,9 @@ class MegaPCSite(BaseSite):
             logger.error(f"{self.name} | PRODUCT_ERROR | {product_data.get('id')} | {e}")
             with self.lock:
                 self.stats["errors"] += 1
+            self._add_error(f"Product error: {str(e)[:50]}")
             return None
-    
+
     # =====================================================
     # ASK FOR CONTINUATION ON ERROR
     # =====================================================
@@ -579,7 +439,7 @@ class MegaPCSite(BaseSite):
         else:
             print("❌ Stopping scrape...")
             return False
-    
+
     # =====================================================
     # PRINT FINAL STATS
     # =====================================================
@@ -602,9 +462,9 @@ class MegaPCSite(BaseSite):
             print(f"\n📈 New product rate: {success_rate:.1f}%")
         
         print(f"{'='*60}\n")
-    
+
     # =====================================================
-    # TEST WITH 5 PRODUCTS
+    # TEST SCRAPE
     # =====================================================
     
     def test_scrape(self, limit: int = 5) -> List[Dict]:
@@ -626,27 +486,30 @@ class MegaPCSite(BaseSite):
                 return self.scrape_site()
         
         return results
-    
+
     # =====================================================
     # MAIN SCRAPE METHOD
     # =====================================================
-    
-    # sites/megapc.py - scrape_site method
 
     def scrape_site(self, force_build_refresh: bool = False) -> List[Dict]:
-        """
-        Main scrape method - ONLY finds and adds NEW products
-        Existing products are skipped
-        """
+        """Main scrape method - ONLY finds and adds NEW products"""
         logger.info(f"{self.name} | SCRAPE_START (NEW PRODUCTS ONLY)")
         log_global(f"{self.name} | SCRAPE_START (NEW PRODUCTS ONLY)")
         
-        # Reset performance tracker
         self.performance = PerformanceTracker()
+
+        # =====================================================
+        # RESET DASHBOARD STATS FOR NEW SCRAPE CYCLE
+        # =====================================================
+        try:
+            from scraping.engine.multi_scrape_progress import get_multi_scrape_progress
+            progress = get_multi_scrape_progress()
+            progress.reset_site(self.name)
+            logger.info(f"{self.name} | DASHBOARD_RESET | new cycle")
+        except Exception as e:
+            logger.debug(f"{self.name} | DASHBOARD_RESET_ERROR | {e}")
         
-        # =====================================================
-        # STEP 1: VALIDATE BUILD ID
-        # =====================================================
+        # Validate build ID
         logger.info("Validating MegaPC build ID...")
         
         if force_build_refresh:
@@ -657,6 +520,7 @@ class MegaPCSite(BaseSite):
         
         if not build_id:
             logger.error("Failed to get build ID. Aborting scrape.")
+            self._add_error("Failed to get build ID")
             return []
         
         if not self._validate_build_id(build_id):
@@ -666,10 +530,12 @@ class MegaPCSite(BaseSite):
             
             if not new_build_id:
                 logger.error("Failed to discover valid build ID. Aborting scrape.")
+                self._add_error("Failed to discover build ID")
                 return []
             
             if not self._validate_build_id(new_build_id):
                 logger.error(f"New build ID {new_build_id} also appears invalid. Aborting scrape.")
+                self._add_error(f"Invalid build ID: {new_build_id}")
                 return []
             
             build_id = new_build_id
@@ -681,21 +547,22 @@ class MegaPCSite(BaseSite):
         self.base_next = f"{self.base_next_url}/{build_id}"
         logger.info(f"Base Next URL: {self.base_next}")
         
-        # =====================================================
-        # STEP 2: INITIALIZE CONNECTIONS
-        # =====================================================
+        # Initialize connections
         results = []
         total_categories = len(CATEGORIES)
         error_count = 0
         
         try:
-            self._init_connections()
+            if not self._init_connections():
+                logger.error(f"{self.name} | CONNECTION_FAILED")
+                self._add_error("Connection failed")
+                return []
         except Exception as e:
             logger.error(f"{self.name} | CONNECTION_FAILED | {e}")
+            self._add_error(f"Connection error: {str(e)[:50]}")
             return []
         
         try:
-            # Reset stats with total categories
             self.stats = {
                 "new_products": 0,
                 "skipped_duplicates": 0,
@@ -713,20 +580,15 @@ class MegaPCSite(BaseSite):
             }
             self.seen_products.clear()
             
-            # Initial stats update
             if hasattr(self, '_update_stats'):
                 self._update_stats(self.stats)
             
-            # =====================================================
-            # STEP 3: PROCESS CATEGORIES
-            # =====================================================
             for i, (cat, subs) in enumerate(CATEGORIES.items(), start=1):
                 if self.test_mode and i > 1:
                     break
                 
                 self.performance.add_category()
                 
-                # Update current category
                 self.stats['current_category'] = cat
                 if hasattr(self, '_update_stats'):
                     self._update_stats(self.stats)
@@ -738,12 +600,17 @@ class MegaPCSite(BaseSite):
                         if not self._ask_continuation(error_count, len(results)):
                             break
                     
-                    # Update current subcategory
                     self.stats['current_category'] = f"{cat} > {sub}"
                     if hasattr(self, '_update_stats'):
                         self._update_stats(self.stats)
                     
-                    products = self.get_products(cat, sub)
+                    try:
+                        products = self.get_products(cat, sub)
+                    except Exception as e:
+                        error_msg = f"Get products failed {cat}: {str(e)[:50]}"
+                        logger.error(f"{self.name} | GET_PRODUCTS_ERROR | {cat} | {e}")
+                        self._add_error(error_msg)
+                        continue
                     
                     if not products:
                         continue
@@ -772,6 +639,7 @@ class MegaPCSite(BaseSite):
                                 sub_error_count += 1
                                 error_count += 1
                                 self.performance.add_error()
+                                self._add_error(f"Future error: {str(e)[:50]}")
                             
                             self.performance.add_product()
                             completed += 1
@@ -783,22 +651,47 @@ class MegaPCSite(BaseSite):
                     if sub_error_count > 0:
                         logger.warning(f"Subcategory had {sub_error_count} errors")
                 
-                # Complete category - update stats
                 self.stats['completed_categories'] = i
                 if hasattr(self, '_update_stats'):
                     self._update_stats(self.stats)
                 
-                logger.info(f"Progress: {i}/{total_categories} categories completed")
+                batch_size = self.get_pending_batch_size()
+                logger.info(f"Progress: {i}/{total_categories} categories completed | batch={batch_size}")
             
-            # Log stats and generate recap
             log_scrape_stats(self.name, self.stats)
             recap_path = end_session()
             
         except KeyboardInterrupt:
             logger.warning(f"{self.name} | INTERRUPTED")
+            try:
+                from scraping.engine.multi_scrape_progress import get_multi_scrape_progress
+                progress = get_multi_scrape_progress()
+                progress.set_status(self.name, "⚠️ Interrupted")
+            except:
+                pass
         except Exception as e:
+            error_msg = f"Scrape failed: {str(e)[:50]}"
             logger.error(f"{self.name} | SCRAPE_ERROR | {e}")
+            import traceback
+            traceback.print_exc()
+            self._add_error(error_msg)
         finally:
+            # =====================================================
+            # FLUSH ANY REMAINING PRODUCTS
+            # =====================================================
+            batch_size = self.get_pending_batch_size()
+            if batch_size > 0:
+                logger.info(f"{self.name} | FLUSHING_PENDING | {batch_size} products")
+                try:
+                    self.flush_pending_batch()
+                except Exception as e:
+                    error_msg = f"Flush failed: {str(e)[:50]}"
+                    logger.error(f"{self.name} | FLUSH_ERROR | {e}")
+                    self._add_error(error_msg)
+            
+            # Log final summary
+            self.log_final_summary(results)
+            
             self._close_connections()
         
         self.performance.print_summary(self.name)
@@ -808,64 +701,23 @@ class MegaPCSite(BaseSite):
         log_global(f"{self.name} | SCRAPE_DONE | total_new={len(results)}")
         
         return results
-    
-    # =====================================================
-    # SEARCH PRODUCTS
-    # =====================================================
-    
+
     def search(self, query: str) -> Optional[Dict]:
         """Search for products on MegaPC"""
         logger.warning(f"{self.name} | SEARCH_NOT_IMPLEMENTED | query={query}")
         return {"products": [], "total_results": 0}
-    
-    # =====================================================
-    # PARSE SINGLE PRODUCT
-    # =====================================================
-    
+
     def parse_product(self, url: str, html: Optional[str] = None) -> Optional[Dict]:
         """Parse a single product from URL"""
         logger.warning(f"{self.name} | PARSE_PRODUCT_NOT_IMPLEMENTED | url={url}")
         return None
-    
-    # =====================================================
-    # EXTRACT CATEGORIES
-    # =====================================================
-    
+
     def extract_categories(self) -> Dict[str, List[str]]:
         """Extract categories from MegaPC"""
         logger.info(f"{self.name} | EXTRACT_CATEGORIES_START")
         logger.info(f"{self.name} | EXTRACT_CATEGORIES_DONE | count={len(CATEGORIES)}")
         return CATEGORIES
-    
-    # =====================================================
-    # VALIDATE BUILD ID
-    # =====================================================
-    
-    def _validate_build_id(self, build_id: str) -> bool:
-        """Validate a build ID by testing with a known endpoint"""
-        try:
-            test_url = f"{self.base_next_url}/{build_id}/shop/product/"
-            response = requests.head(test_url, timeout=10, allow_redirects=True)
-            
-            if response.status_code in [200, 404]:
-                logger.debug(f"Build ID {build_id} validated (status={response.status_code})")
-                return True
-            
-            logger.warning(f"Build ID {build_id} validation failed (status={response.status_code})")
-            return False
-            
-        except requests.RequestException as e:
-            logger.warning(f"Build ID validation error: {e}")
-            return False
-        except Exception as e:
-            logger.warning(f"Unexpected validation error: {e}")
-            return False
 
-
-# =====================================================
-# FACTORY FUNCTION
-# =====================================================
 
 def create_megapc_site() -> MegaPCSite:
-    """Factory function to create MegaPC site instance"""
     return MegaPCSite()

@@ -7,14 +7,18 @@ from bs4 import BeautifulSoup
 from datetime import datetime
 from core.logger import setup_logger
 from core.Web.product_schema import create_product_schema
-from core.utils.price_cleaner import clean_price_tunisianet
+from core.utils.price_cleaner import clean_price, clean_price_tunisianet
+from core.utils.clean_text_parser import clean_and_decode_text, normalize_availability
+from core.utils.Dclean_html import clean_html
+from core.utils.cleaning_url_logic import normalize_url
+from core.utils.clean_date_logic import clean_date
 
 logger = setup_logger("spacenet", "scraper")
 
 
 def parse_spacenet_product_page(html: str, url: str, site_name: str, product_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """
-    Parse Spacenet product page - returns None if product data is invalid.
+    Parse Spacenet product page using utility functions for cleaning.
     ALWAYS returns a dictionary or None. NEVER returns a set.
     """
     # =====================================================
@@ -49,7 +53,6 @@ def parse_spacenet_product_page(html: str, url: str, site_name: str, product_id:
     # Check if product is a set (the problem we're fixing)
     if isinstance(product, set):
         logger.error(f"{site_name} | SCHEMA_RETURNED_SET | {url} | product is a set")
-        # Try to convert set to dict
         try:
             for item in product:
                 if isinstance(item, dict):
@@ -58,7 +61,6 @@ def parse_spacenet_product_page(html: str, url: str, site_name: str, product_id:
                     break
         except:
             pass
-        # If still a set, return None
         if isinstance(product, set):
             return None
     
@@ -69,7 +71,7 @@ def parse_spacenet_product_page(html: str, url: str, site_name: str, product_id:
     # =====================================================
     # STEP 4: Set basic product fields
     # =====================================================
-    product["url"] = url
+    product["url"] = normalize_url(url)
     product["main_product_id"] = product_id
 
     # =====================================================
@@ -84,6 +86,12 @@ def parse_spacenet_product_page(html: str, url: str, site_name: str, product_id:
                 if data.get("@type") == "Product":
                     product_json = data
                     break
+                # Also check for @graph containing Product
+                elif data.get("@graph"):
+                    for item in data.get("@graph", []):
+                        if item.get("@type") == "Product":
+                            product_json = item
+                            break
         except Exception as e:
             logger.debug(f"{site_name} | JSON parse error | {e}")
 
@@ -99,26 +107,22 @@ def parse_spacenet_product_page(html: str, url: str, site_name: str, product_id:
             name_elem = soup.find("h1")
         
         if name_elem:
-            product["name"] = name_elem.text.strip()
+            product["name"] = clean_and_decode_text(name_elem.text)
         else:
             logger.warning(f"{site_name} | NO_PRODUCT_NAME | {url}")
             return None
         
-        # Extract price from HTML
+        # Extract price from HTML using price_cleaner
         price_elem = soup.find("span", class_="price")
         if price_elem:
-            try:
-                price_text = price_elem.text.strip()
-                product["price"] = clean_price_tunisianet(price_text)
-            except:
-                product["price"] = 0
+            product["price"] = clean_price(price_elem.text.strip())
         else:
             product["price"] = 0
         
-        # Extract availability
+        # Extract availability using normalize_availability
         avail_elem = soup.find("span", class_="availability")
         if avail_elem:
-            product["availability"] = "InStock" if "disponible" in avail_elem.text.lower() else "OutOfStock"
+            product["availability"] = normalize_availability(avail_elem.text)
         else:
             product["availability"] = "OutOfStock"
         
@@ -127,9 +131,7 @@ def parse_spacenet_product_page(html: str, url: str, site_name: str, product_id:
             logger.warning(f"{site_name} | INVALID_PRODUCT_NO_DATA | {url}")
             return None
         
-        # =====================================================
         # FINAL VALIDATION for HTML fallback
-        # =====================================================
         if isinstance(product, set):
             logger.error(f"{site_name} | FALLBACK_PRODUCT_IS_SET | {url}")
             return None
@@ -143,23 +145,28 @@ def parse_spacenet_product_page(html: str, url: str, site_name: str, product_id:
     # =====================================================
     # STEP 7: Extract Base Fields from JSON
     # =====================================================
-    product["name"] = product_json.get("name")
-    product["brand"] = product_json.get("brand", {}).get("name") if isinstance(product_json.get("brand"), dict) else product_json.get("brand")
-    product["category"] = product_json.get("category")
+    product["name"] = clean_and_decode_text(product_json.get("name", ""))
+    product["brand"] = clean_and_decode_text(product_json.get("brand", {}).get("name")) if isinstance(product_json.get("brand"), dict) else clean_and_decode_text(product_json.get("brand"))
+    product["category"] = clean_and_decode_text(product_json.get("category"))
     
     if not product_id:
-        product["main_product_id"] = product_json.get("productID")
+        product["main_product_id"] = product_json.get("productID") or product_json.get("sku")
+        if product["main_product_id"]:
+            product["main_product_id"] = str(product["main_product_id"])
 
-    product["special_id"] = product_json.get("sku")
-    product["description"] = product_json.get("description")
+    product["special_id"] = clean_and_decode_text(product_json.get("sku"))
+    product["description"] = clean_html(product_json.get("description", ""))
     
+    # Extract images
     images = product_json.get("image")
     if images:
-        product["images"] = images if isinstance(images, list) else [images]
+        if isinstance(images, str):
+            images = [images]
+        product["images"] = [normalize_url(img) for img in images if img]
         product["main_image"] = product["images"][0] if product["images"] else None
 
     # =====================================================
-    # STEP 8: Price Extraction from HTML
+    # STEP 8: Price Extraction from HTML using price_cleaner
     # =====================================================
     price_block = soup.find("div", {"class": "product-prices"})
 
@@ -176,25 +183,25 @@ def parse_spacenet_product_page(html: str, url: str, site_name: str, product_id:
             if current_price_div:
                 discount_price_span = current_price_div.find("span", {"content": True})
                 if discount_price_span:
-                    product["discount_price"] = clean_price_tunisianet(discount_price_span.text)
+                    product["discount_price"] = clean_price(discount_price_span.text)
                 
                 discount_amount_span = current_price_div.find("span", {"class": "discount discount-amount"})
                 if discount_amount_span:
-                    product["discount_amount"] = clean_price_tunisianet(discount_amount_span.text)
+                    product["discount_amount"] = clean_price(discount_amount_span.text)
             
             # Original/regular price
             regular_price_div = price_block.find("div", {"class": "product-discount"})
             if regular_price_div:
                 regular_price_span = regular_price_div.find("span", {"class": "regular-price"})
                 if regular_price_span:
-                    product["price"] = clean_price_tunisianet(regular_price_span.text)
+                    product["price"] = clean_price(regular_price_span.text)
         else:
             # No discount, fallback to JSON script price
             offers = product_json.get("offers", {})
             if isinstance(offers, dict):
-                product["price"] = float(offers.get("price", 0))
+                product["price"] = clean_price(offers.get("price", 0))
             elif isinstance(offers, list) and len(offers) > 0:
-                product["price"] = float(offers[0].get("price", 0))
+                product["price"] = clean_price(offers[0].get("price", 0))
             else:
                 product["price"] = 0
 
@@ -204,9 +211,9 @@ def parse_spacenet_product_page(html: str, url: str, site_name: str, product_id:
     if product["price"] == 0:
         offers = product_json.get("offers", {})
         if isinstance(offers, dict):
-            product["price"] = float(offers.get("price", 0))
+            product["price"] = clean_price(offers.get("price", 0))
         elif isinstance(offers, list) and len(offers) > 0:
-            product["price"] = float(offers[0].get("price", 0))
+            product["price"] = clean_price(offers[0].get("price", 0))
 
     # =====================================================
     # STEP 10: Validate product has required fields
@@ -216,11 +223,11 @@ def parse_spacenet_product_page(html: str, url: str, site_name: str, product_id:
         return None
     
     if product["price"] <= 0:
-        # Try one more time from HTML
+        # Try one more time from HTML using price_cleaner
         price_elem = soup.find("span", class_="price")
         if price_elem:
             try:
-                product["price"] = clean_price_tunisianet(price_elem.text.strip())
+                product["price"] = clean_price(price_elem.text.strip())
             except:
                 pass
         
@@ -229,39 +236,75 @@ def parse_spacenet_product_page(html: str, url: str, site_name: str, product_id:
             return None
 
     # =====================================================
-    # STEP 11: Extract Availability
+    # STEP 11: Extract Availability using normalize_availability
     # =====================================================
     offers = product_json.get("offers", {})
     if isinstance(offers, dict):
         availability = offers.get("availability")
         if availability:
-            product["availability"] = availability.split("/")[-1]
+            product["availability"] = normalize_availability(availability.split("/")[-1])
     elif isinstance(offers, list) and len(offers) > 0:
         availability = offers[0].get("availability")
         if availability:
-            product["availability"] = availability.split("/")[-1]
+            product["availability"] = normalize_availability(availability.split("/")[-1])
 
     if not product.get("availability"):
         avail_elem = soup.find("span", class_="availability")
         if avail_elem:
-            product["availability"] = "InStock" if "disponible" in avail_elem.text.lower() else "OutOfStock"
+            product["availability"] = normalize_availability(avail_elem.text)
         else:
             product["availability"] = "OutOfStock"
 
     # =====================================================
-    # STEP 12: Special ID fallback
+    # STEP 12: Price Valid Until - using clean_date
+    # =====================================================
+    valid_until = None
+    if isinstance(offers, dict):
+        valid_until = offers.get("priceValidUntil")
+    elif isinstance(offers, list) and len(offers) > 0:
+        valid_until = offers[0].get("priceValidUntil")
+    
+    if valid_until:
+        product["price_valid_until"] = clean_date(valid_until)
+
+    # =====================================================
+    # STEP 13: Special ID fallback
     # =====================================================
     if not product.get("special_id"):
         reference_elem = soup.find("span", class_="product-reference")
         if reference_elem:
-            product["special_id"] = reference_elem.text.strip()
+            product["special_id"] = clean_and_decode_text(reference_elem.text)
+        
+        # Try from meta
+        if not product.get("special_id"):
+            sku_meta = soup.find("meta", {"property": "product:retailer_item_id"})
+            if sku_meta:
+                product["special_id"] = clean_and_decode_text(sku_meta.get("content", ""))
 
     # =====================================================
-    # STEP 13: FINAL VALIDATION - Ensure we return a dict
+    # STEP 14: Extract Short Description from attributes table
+    # =====================================================
+    if not product.get("short_description"):
+        product["short_description"] = {}
+    
+    # Try to extract specs from table
+    specs_table = soup.find("table", class_="data table additional-attributes")
+    if specs_table:
+        rows = specs_table.find_all("tr")
+        for row in rows:
+            th = row.find("th")
+            td = row.find("td")
+            if th and td:
+                key = clean_and_decode_text(th.text)
+                value = clean_and_decode_text(td.text)
+                if key and value:
+                    product["short_description"][key] = value
+
+    # =====================================================
+    # STEP 15: FINAL VALIDATION - Ensure we return a dict
     # =====================================================
     if isinstance(product, set):
         logger.error(f"{site_name} | FINAL_PRODUCT_IS_SET | {url} | product is a set")
-        # Try to convert set to dict one last time
         try:
             for item in product:
                 if isinstance(item, dict):
@@ -278,7 +321,7 @@ def parse_spacenet_product_page(html: str, url: str, site_name: str, product_id:
         return None
 
     # =====================================================
-    # STEP 14: Log success and return
+    # STEP 16: Log success and return
     # =====================================================
     logger.debug(f"{site_name} | PRODUCT_PARSED | {product.get('name', 'Unknown')[:50]}...")
     
@@ -286,7 +329,9 @@ def parse_spacenet_product_page(html: str, url: str, site_name: str, product_id:
 
 
 def fast_check_spacenet_product(url: str, product_id: str = None) -> Optional[Dict[str, Any]]:
-    """Quick check function for Spacenet products."""
+    """
+    Quick check function for Spacenet products using utility functions.
+    """
     from core.Web.http_client import get
     
     try:
