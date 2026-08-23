@@ -39,7 +39,7 @@ class BatchManager:
             return
         
         self._initialized = True
-        self.batch_size = 10  # Reduced to 10 for testing
+        self.batch_size = 50  # Changed back to 50 for production
         self.flush_interval = 10  # 10 seconds flush interval
         
         # Per-site pending products
@@ -55,6 +55,10 @@ class BatchManager:
         
         # DB connection
         self.db = None
+        
+        # Track if we're currently flushing to prevent recursive flushes
+        self._flushing = False
+        self._flush_lock = threading.Lock()
         
         logger.info("=" * 60)
         logger.info(f"BATCH_MANAGER_INITIALIZED | batch_size={self.batch_size}, flush_interval={self.flush_interval}s | instance_id={id(self)}")
@@ -80,7 +84,8 @@ class BatchManager:
                 'flushed': 0,
                 'errors': 0,
                 'total_added': 0,
-                'last_flush': None
+                'last_flush': None,
+                'pending_count': 0
             }
         return self.pending_products[site_key]
     
@@ -91,12 +96,14 @@ class BatchManager:
         """
         site_key = site.lower()
         lock = self._get_lock(site_key)
+        queue_size = 0
         
         with lock:
             pending = self._get_pending(site_key)
             pending.append(product)
             self.stats[site_key]['queued'] += 1
             self.stats[site_key]['total_added'] += 1
+            self.stats[site_key]['pending_count'] = len(pending)
             
             queue_size = len(pending)
             logger.debug(f"BATCH_MANAGER | {site_key} | ADDED | product_id={product_id} | queue={queue_size}")
@@ -104,11 +111,9 @@ class BatchManager:
             # Check if we should flush (batch full)
             if queue_size >= self.batch_size:
                 logger.info(f"BATCH_MANAGER | {site_key} | BATCH_FULL | {queue_size} products | flushing...")
-                # Call flush - it will handle its own locking
-                # Release the lock before calling flush to avoid deadlock
-                pass
+                # We'll flush outside the lock to avoid deadlock
         
-        # Call flush outside the lock
+        # Call flush outside the lock if batch is full
         if queue_size >= self.batch_size:
             return self.flush_site(site_key)
         
@@ -119,160 +124,179 @@ class BatchManager:
         site_key = site.lower()
         lock = self._get_lock(site_key)
         
-        logger.info(f"BATCH_MANAGER | {site_key} | FLUSH_SITE_CALLED")
-        
-        with lock:
-            pending = self._get_pending(site_key)
-            if not pending:
-                logger.debug(f"BATCH_MANAGER | {site_key} | FLUSH_SKIP | no pending products")
+        # Prevent recursive flushing
+        with self._flush_lock:
+            if self._flushing:
+                logger.debug(f"BATCH_MANAGER | {site_key} | ALREADY_FLUSHING | skipping recursive call")
                 return True
-            
-            queue_size = len(pending)
-            logger.info("=" * 60)
-            logger.info(f"BATCH_MANAGER | {site_key} | FLUSH_START | {queue_size} products")
-            
-            # Copy products and clear queue
-            batch_copy = pending.copy()
-            pending.clear()
-            self.stats[site_key]['flushed'] += 1
-            self.stats[site_key]['last_flush'] = datetime.now().isoformat()
-            
-            # Log product IDs being flushed
-            product_ids = []
-            for p in batch_copy[:10]:
-                product_ids.append(p.get('main_product_id', 'unknown'))
-            logger.info(f"BATCH_MANAGER | {site_key} | PRODUCT_IDS | {product_ids}")
+            self._flushing = True
         
-        # Now save to DB (outside the lock to avoid long hold)
         try:
-            # =====================================================
-            # ENSURE DB CONNECTION
-            # =====================================================
-            logger.info(f"BATCH_MANAGER | {site_key} | DB_CONNECTING...")
+            logger.info(f"BATCH_MANAGER | {site_key} | FLUSH_SITE_CALLED | thread={threading.current_thread().name}")
             
-            if self.db is None:
-                from Database.Postgresql.db import Database
-                self.db = Database()
-                logger.info(f"BATCH_MANAGER | {site_key} | DB_CONNECTED | {id(self.db)}")
+            with lock:
+                pending = self._get_pending(site_key)
+                if not pending:
+                    logger.debug(f"BATCH_MANAGER | {site_key} | FLUSH_SKIP | no pending products")
+                    self._flushing = False
+                    return True
                 
-                # Verify connection
-                if self.db and hasattr(self.db, 'conn') and self.db.conn:
-                    logger.info(f"BATCH_MANAGER | {site_key} | DB_VERIFIED | connection active")
+                queue_size = len(pending)
+                logger.info("=" * 60)
+                logger.info(f"BATCH_MANAGER | {site_key} | FLUSH_START | {queue_size} products")
+                
+                # Copy products and clear queue
+                batch_copy = pending.copy()
+                pending.clear()
+                self.stats[site_key]['flushed'] += 1
+                self.stats[site_key]['last_flush'] = datetime.now().isoformat()
+                self.stats[site_key]['pending_count'] = 0
+                
+                # Log product IDs being flushed
+                product_ids = []
+                for p in batch_copy[:10]:
+                    product_ids.append(p.get('main_product_id', 'unknown'))
+                logger.info(f"BATCH_MANAGER | {site_key} | PRODUCT_IDS | {product_ids}")
+            
+            # Now save to DB (outside the lock to avoid long hold)
+            try:
+                # =====================================================
+                # ENSURE DB CONNECTION
+                # =====================================================
+                logger.info(f"BATCH_MANAGER | {site_key} | DB_CONNECTING...")
+                
+                if self.db is None:
+                    from Database.Postgresql.db import Database
+                    self.db = Database()
+                    logger.info(f"BATCH_MANAGER | {site_key} | DB_CONNECTED | {id(self.db)}")
+                    
+                    # Verify connection
+                    if self.db and hasattr(self.db, 'conn') and self.db.conn:
+                        logger.info(f"BATCH_MANAGER | {site_key} | DB_VERIFIED | connection active")
+                    else:
+                        logger.error(f"BATCH_MANAGER | {site_key} | DB_CONNECTION_FAILED")
+                        # Restore products
+                        with lock:
+                            pending = self._get_pending(site_key)
+                            pending = batch_copy + pending
+                            self.pending_products[site_key] = pending
+                            self.stats[site_key]['pending_count'] = len(pending)
+                        self._flushing = False
+                        return False
                 else:
-                    logger.error(f"BATCH_MANAGER | {site_key} | DB_CONNECTION_FAILED")
-                    # Restore products
-                    lock = self._get_lock(site_key)
+                    logger.info(f"BATCH_MANAGER | {site_key} | DB_REUSING | {id(self.db)}")
+                
+                # =====================================================
+                # SERIALIZE PRODUCTS
+                # =====================================================
+                logger.info(f"BATCH_MANAGER | {site_key} | SERIALIZING | {len(batch_copy)} products")
+                
+                serialized_batch = []
+                failed_products = []
+                
+                for idx, p in enumerate(batch_copy):
+                    if p:
+                        try:
+                            serialized = self._make_json_serializable(p)
+                            if serialized:
+                                serialized_batch.append(serialized)
+                            else:
+                                failed_products.append(p)
+                                logger.warning(f"BATCH_MANAGER | {site_key} | SERIALIZE_FAIL | index={idx}")
+                        except Exception as e:
+                            failed_products.append(p)
+                            logger.error(f"BATCH_MANAGER | {site_key} | SERIALIZE_ERROR | index={idx} | {e}")
+                
+                logger.info(f"BATCH_MANAGER | {site_key} | SERIALIZED | {len(serialized_batch)} valid, {len(failed_products)} failed")
+                
+                if not serialized_batch:
+                    logger.warning(f"BATCH_MANAGER | {site_key} | NO_VALID_PRODUCTS | skipping save")
+                    # Restore failed products
+                    if failed_products:
+                        with lock:
+                            pending = self._get_pending(site_key)
+                            pending = failed_products + pending
+                            self.pending_products[site_key] = pending
+                            self.stats[site_key]['pending_count'] = len(pending)
+                    self._flushing = False
+                    return True
+                
+                # =====================================================
+                # ACTUAL DB SAVE
+                # =====================================================
+                logger.info(f"BATCH_MANAGER | {site_key} | DB_SAVE_START | {len(serialized_batch)} products")
+                logger.info("-" * 60)
+                
+                # Log first product for debugging
+                if serialized_batch:
+                    first = serialized_batch[0]
+                    logger.info(f"BATCH_MANAGER | {site_key} | FIRST_PRODUCT | id={first.get('main_product_id')} | name={first.get('name', '')[:30]}")
+                
+                try:
+                    # Force a commit by calling upsert_products
+                    result = self.db.upsert_products(serialized_batch)
+                    
+                    # Update stats
+                    with lock:
+                        self.stats[site_key]['saved'] += result
+                    
+                    logger.info(f"BATCH_MANAGER | {site_key} | DB_SAVE_COMPLETE | saved={result}/{len(serialized_batch)} products")
+                    logger.info("=" * 60)
+                    
+                    # Log any failed products
+                    if failed_products:
+                        logger.warning(f"BATCH_MANAGER | {site_key} | FAILED_PRODUCTS | {len(failed_products)} products not saved")
+                        with lock:
+                            pending = self._get_pending(site_key)
+                            pending = failed_products + pending
+                            self.pending_products[site_key] = pending
+                            self.stats[site_key]['pending_count'] = len(pending)
+                    
+                    # Force flush the logger
+                    for handler in logger.handlers:
+                        try:
+                            handler.flush()
+                        except:
+                            pass
+                    
+                    self._flushing = False
+                    return True
+                    
+                except Exception as db_error:
+                    logger.error(f"BATCH_MANAGER | {site_key} | DB_SAVE_ERROR | {db_error}")
+                    import traceback
+                    traceback.print_exc()
+                    
+                    # Restore all products on error
                     with lock:
                         pending = self._get_pending(site_key)
                         pending = batch_copy + pending
                         self.pending_products[site_key] = pending
+                        self.stats[site_key]['pending_count'] = len(pending)
+                        self.stats[site_key]['errors'] += 1
+                    
+                    self._flushing = False
                     return False
-            else:
-                logger.info(f"BATCH_MANAGER | {site_key} | DB_REUSING | {id(self.db)}")
-            
-            # =====================================================
-            # SERIALIZE PRODUCTS
-            # =====================================================
-            logger.info(f"BATCH_MANAGER | {site_key} | SERIALIZING | {len(batch_copy)} products")
-            
-            serialized_batch = []
-            failed_products = []
-            
-            for idx, p in enumerate(batch_copy):
-                if p:
-                    try:
-                        serialized = self._make_json_serializable(p)
-                        if serialized:
-                            serialized_batch.append(serialized)
-                        else:
-                            failed_products.append(p)
-                            logger.warning(f"BATCH_MANAGER | {site_key} | SERIALIZE_FAIL | index={idx}")
-                    except Exception as e:
-                        failed_products.append(p)
-                        logger.error(f"BATCH_MANAGER | {site_key} | SERIALIZE_ERROR | index={idx} | {e}")
-            
-            logger.info(f"BATCH_MANAGER | {site_key} | SERIALIZED | {len(serialized_batch)} valid, {len(failed_products)} failed")
-            
-            if not serialized_batch:
-                logger.warning(f"BATCH_MANAGER | {site_key} | NO_VALID_PRODUCTS | skipping save")
-                # Restore failed products
-                if failed_products:
-                    lock = self._get_lock(site_key)
-                    with lock:
-                        pending = self._get_pending(site_key)
-                        pending = failed_products + pending
-                        self.pending_products[site_key] = pending
-                return True
-            
-            # =====================================================
-            # ACTUAL DB SAVE
-            # =====================================================
-            logger.info(f"BATCH_MANAGER | {site_key} | DB_SAVE_START | {len(serialized_batch)} products")
-            logger.info("-" * 60)
-            
-            # Log first product for debugging
-            if serialized_batch:
-                first = serialized_batch[0]
-                logger.info(f"BATCH_MANAGER | {site_key} | FIRST_PRODUCT | id={first.get('main_product_id')} | name={first.get('name', '')[:30]}")
-            
-            try:
-                # Force a commit by calling upsert_products
-                result = self.db.upsert_products(serialized_batch)
                 
-                # Update stats
-                lock = self._get_lock(site_key)
-                with lock:
-                    self.stats[site_key]['saved'] += result
-                
-                logger.info(f"BATCH_MANAGER | {site_key} | DB_SAVE_COMPLETE | saved={result}/{len(serialized_batch)} products")
-                logger.info("=" * 60)
-                
-                # Log any failed products
-                if failed_products:
-                    logger.warning(f"BATCH_MANAGER | {site_key} | FAILED_PRODUCTS | {len(failed_products)} products not saved")
-                    lock = self._get_lock(site_key)
-                    with lock:
-                        pending = self._get_pending(site_key)
-                        pending = failed_products + pending
-                        self.pending_products[site_key] = pending
-                
-                # Force flush the logger
-                for handler in logger.handlers:
-                    try:
-                        handler.flush()
-                    except:
-                        pass
-                
-                return True
-                
-            except Exception as db_error:
-                logger.error(f"BATCH_MANAGER | {site_key} | DB_SAVE_ERROR | {db_error}")
+            except Exception as e:
+                logger.error(f"BATCH_MANAGER | {site_key} | FLUSH_ERROR | {e}")
                 import traceback
                 traceback.print_exc()
                 
-                # Restore all products on error
-                lock = self._get_lock(site_key)
+                # Restore products on error
                 with lock:
                     pending = self._get_pending(site_key)
                     pending = batch_copy + pending
                     self.pending_products[site_key] = pending
+                    self.stats[site_key]['pending_count'] = len(pending)
                     self.stats[site_key]['errors'] += 1
                 
+                self._flushing = False
                 return False
-            
+                
         except Exception as e:
-            logger.error(f"BATCH_MANAGER | {site_key} | FLUSH_ERROR | {e}")
-            import traceback
-            traceback.print_exc()
-            
-            # Restore products on error
-            lock = self._get_lock(site_key)
-            with lock:
-                pending = self._get_pending(site_key)
-                pending = batch_copy + pending
-                self.pending_products[site_key] = pending
-                self.stats[site_key]['errors'] += 1
-            
+            logger.error(f"BATCH_MANAGER | {site_key} | FLUSH_EXCEPTION | {e}")
+            self._flushing = False
             return False
     
     def flush_all(self) -> bool:
@@ -281,7 +305,9 @@ class BatchManager:
         logger.info("BATCH_MANAGER | FLUSHING_ALL_SITES")
         
         success = True
-        for site in list(self.pending_products.keys()):
+        sites = list(self.pending_products.keys())
+        
+        for site in sites:
             logger.info(f"BATCH_MANAGER | FLUSH_SITE | {site}")
             if not self.flush_site(site):
                 success = False
@@ -329,7 +355,7 @@ class BatchManager:
     
     def _timer_loop(self):
         """Timer loop that flushes all sites at regular intervals."""
-        logger.info(f"BATCH_MANAGER | TIMER_LOOP_STARTED | interval={self.flush_interval}s")
+        logger.info(f"BATCH_MANAGER | TIMER_LOOP_STARTED | interval={self.flush_interval}s | thread={threading.current_thread().name}")
         loop_count = 0
         
         while not self._stop_timer:
@@ -352,6 +378,7 @@ class BatchManager:
             if sites_to_flush:
                 for site, count in sites_to_flush:
                     logger.info(f"BATCH_MANAGER | {site} | TIMER_TRIGGERED | loop={loop_count} | {count} products | interval={self.flush_interval}s")
+                    # Call flush_site without holding any site lock
                     self.flush_site(site)
             else:
                 # Only log every 5th loop to reduce noise
@@ -431,3 +458,14 @@ def shutdown_batch_manager():
     if _batch_manager_instance:
         _batch_manager_instance.shutdown()
         _batch_manager_instance = None
+
+
+# =====================================================
+# EXPORTS
+# =====================================================
+
+__all__ = [
+    'BatchManager',
+    'get_batch_manager',
+    'shutdown_batch_manager',
+]

@@ -50,16 +50,6 @@ class MegaPCSite(BaseSite):
         self.current_build_id = None
         self.base_next = None
         self._update_base_next_url()
-
-        # SmartRequester for product details
-        self.set_requester_config(
-            requests_per_minute=50,
-            max_retries=3,
-            timeout=30,
-            use_session=True,
-            use_referer=True,
-            delay_between_requests=(0.5, 1.5)
-        )
         
         self.lock = threading.Lock()
         self.seen_products: Set[str] = set()
@@ -74,7 +64,7 @@ class MegaPCSite(BaseSite):
 
     def get_requester_config(self) -> Dict:
         return {
-            "requests_per_minute": 50,
+            "requests_per_minute": 100,
             "max_retries": 3,
             "timeout": 30,
             "use_session": True,

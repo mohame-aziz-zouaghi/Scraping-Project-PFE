@@ -1,6 +1,6 @@
 # sites/base_site.py
 """
-Base Site class with batching, progress tracking, auto-flush on shutdown, 
+Base Site class with batching (via BatchManager), progress tracking, auto-flush on shutdown, 
 universal connection management, and SmartRequester integration.
 """
 import json
@@ -15,6 +15,7 @@ import sys
 from core.logger import setup_logger
 from core.shutdown_handler import register_flush_hook
 from core.Web.smart_requester import SmartRequester, create_requester
+from core.batch_manager import get_batch_manager, shutdown_batch_manager
 from Database.Redis.product_cache import ProductCache
 from Database.Postgresql.db import Database
 from Database.Redis.Configuration.redis_client import get_redis_client, get_redis_pool_stats
@@ -25,10 +26,25 @@ logger.setLevel(logging.DEBUG)
 
 class BaseSite:
     """
-    Base site class with batching, auto-flush on shutdown, and universal connection management
+    Base site class with batching (via BatchManager), auto-flush on shutdown, 
+    and universal connection management.
     """
 
     name = "BASE"
+
+    # =====================================================
+    # DEFAULT REQUESTER CONFIGURATION - Used by all sites
+    # =====================================================
+    DEFAULT_REQUESTER_CONFIG = {
+        "requests_per_minute": 15,
+        "max_retries": 3,
+        "timeout": 30,
+        "use_session": True,
+        "use_referer": True,
+        "verify_ssl": True,
+        "delay_between_requests": (0.3, 1.5),
+        "use_basic_headers": False,
+    }
 
     def __init__(self):
         logger.info(f"BASE_SITE_INIT | {self.name} | Starting BaseSite initialization... | instance_id={id(self)}")
@@ -54,30 +70,13 @@ class BaseSite:
         # =====================================================
         self._requester = None
         self._requester_initialized = False
-        self._requester_config = {
-            "requests_per_minute": 15,
-            "max_retries": 3,
-            "timeout": 30,
-            "use_session": True,
-            "use_referer": True,
-            "verify_ssl": True,
-            "delay_between_requests": (0.3, 1.5),
-            "use_basic_headers": False,
-        }
+        self._requester_config = self.DEFAULT_REQUESTER_CONFIG.copy()
         
         # =====================================================
-        # BATCHING CONFIGURATION
+        # BATCH MANAGER - Centralized batching for all sites
         # =====================================================
-        self.pending_products: List[Dict] = []
-        self.batch_size = 50
-        self.batch_flush_interval = 30
-        self._batch_lock = threading.Lock()
-        self._product_counter = 0
-        self._is_scraping = False
-        self._last_batch_flush = time.time()
-        self._batch_timer_thread = None
-        self._stop_timer = False
-        self._flush_count = 0
+        self._batch_manager = get_batch_manager()
+        logger.info(f"{self.name} | BATCH_MANAGER_ACQUIRED | instance_id={id(self._batch_manager)}")
         
         # Category tracking
         self.current_category_index = 0
@@ -100,30 +99,32 @@ class BaseSite:
         except Exception as e:
             logger.error(f"BASE_SITE_SHUTDOWN_HOOK_ERROR | {self.name} | {e}")
         
-        # Start batch timer thread
-        self._start_batch_timer()
+        # =====================================================
+        # NO BATCH TIMER - BatchManager handles timing centrally
+        # =====================================================
+        
+        # =====================================================
+        # INITIALIZE REQUESTER WITH SITE-SPECIFIC CONFIG
+        # =====================================================
+        self._init_requester()
+        
         logger.info(f"BASE_SITE_INIT_DONE | {self.name} | instance_id={id(self)}")
     
     # =====================================================
-    # SMART REQUESTER MANAGEMENT - LAZY INITIALIZATION
+    # SMART REQUESTER MANAGEMENT - Single initialization
     # =====================================================
     
     @property
     def requester(self) -> SmartRequester:
-        """
-        Get or create the SmartRequester instance.
-        Lazy initialization - only created when first accessed.
-        """
-        if not self._requester_initialized:
-            self._init_requester()
+        """Get the SmartRequester instance (already initialized)."""
         return self._requester
     
     def _init_requester(self):
-        """Initialize the SmartRequester with site-specific config"""
+        """Initialize the SmartRequester with site-specific config - called ONCE in __init__"""
         if self._requester_initialized:
             return self._requester
         
-        # For SKYMIL, we don't need a requester
+        # For SKYMIL, we don't need a requester (loads from JSON)
         if self.name == "SKYMIL":
             self._requester = None
             self._requester_initialized = True
@@ -131,18 +132,21 @@ class BaseSite:
         
         site_name = self.name.lower() if self.name else "default"
         
-        # Get site-specific config or use defaults
-        config = self._requester_config.copy()
+        # Start with default config
+        config = self.DEFAULT_REQUESTER_CONFIG.copy()
         
-        # Allow sites to override config via get_requester_config method
+        # ONLY CALL get_requester_config() ONCE - single source of truth
         if hasattr(self, 'get_requester_config'):
             site_config = self.get_requester_config()
-            # Remove site_name if present (it's passed separately)
-            site_config.pop('site_name', None)
-            config.update(site_config)
+            if site_config:
+                # Remove site_name if present (it's passed separately)
+                site_config.pop('site_name', None)
+                # Update config with site-specific values
+                config.update(site_config)
+                logger.info(f"{self.name} | REQUESTER_CONFIG_LOADED | {site_config}")
         
-        # Remove site_name from the main config (just in case)
-        config.pop('site_name', None)
+        # Store the final config
+        self._requester_config = config.copy()
         
         try:
             self._requester = create_requester(site_name=site_name, config=config)
@@ -157,70 +161,38 @@ class BaseSite:
         
         return self._requester
     
-    def set_requester_config(self, **kwargs):
-        """Update requester configuration"""
+    def update_requester_config(self, **kwargs):
+        """
+        Dynamically update requester configuration at runtime.
+        Only use this for temporary changes or debugging.
+        """
+        if not self._requester_initialized:
+            self._init_requester()
+            return
+        
+        # Update stored config
         self._requester_config.update(kwargs)
-        # If already initialized, update the requester
-        if self._requester_initialized and self._requester:
+        
+        # Update the requester if it exists
+        if self._requester:
             try:
                 self._requester.update_config(**kwargs)
                 logger.info(f"{self.name} | REQUESTER_CONFIG_UPDATED | {kwargs}")
             except Exception as e:
                 logger.error(f"{self.name} | REQUESTER_UPDATE_ERROR | {e}")
         else:
-            logger.info(f"{self.name} | REQUESTER_CONFIG_STORED | {kwargs}")
+            logger.warning(f"{self.name} | REQUESTER_NOT_INITIALIZED | cannot update config")
     
     def get_requester_config(self) -> Dict:
-        """Override this in child classes for site-specific configs"""
+        """
+        Override this in child classes for site-specific configs.
+        This is called ONCE during initialization.
+        """
         return {}
 
     def _add_error(self, error_msg: str):
         """Helper method to add error to dashboard - override in child classes"""
         pass
-    
-    # =====================================================
-    # BATCH TIMER
-    # =====================================================
-    
-    def _start_batch_timer(self):
-        """Start a background thread that flushes the batch at regular intervals"""
-        if self._batch_timer_thread is None or not self._batch_timer_thread.is_alive():
-            self._stop_timer = False
-            self._batch_timer_thread = threading.Thread(
-                target=self._batch_timer_loop,
-                name=f"{self.name}_BatchTimer",
-                daemon=True
-            )
-            self._batch_timer_thread.start()
-            logger.info(f"{self.name} | BATCH_TIMER_STARTED | interval={self.batch_flush_interval}s")
-    
-    def _stop_batch_timer(self):
-        """Stop the batch timer thread"""
-        self._stop_timer = True
-        if self._batch_timer_thread and self._batch_timer_thread.is_alive():
-            self._batch_timer_thread.join(timeout=2)
-            logger.info(f"{self.name} | BATCH_TIMER_STOPPED")
-    
-    def _batch_timer_loop(self):
-        """Timer loop that flushes batch at regular intervals"""
-        logger.info(f"{self.name} | BATCH_TIMER_LOOP_STARTED | interval={self.batch_flush_interval}s")
-        loop_count = 0
-        
-        while not self._stop_timer:
-            time.sleep(self.batch_flush_interval)
-            loop_count += 1
-            
-            if not self._stop_timer:
-                # Check if we need to flush
-                with self._batch_lock:
-                    batch_size = len(self.pending_products)
-                    if batch_size > 0:
-                        logger.info(f"{self.name} | BATCH_TIMER_TRIGGERED | loop={loop_count} | {batch_size} products")
-                        self._flush_batch_locked()
-                    else:
-                        logger.debug(f"{self.name} | BATCH_TIMER_CHECK | loop={loop_count} | no products to flush")
-        
-        logger.info(f"{self.name} | BATCH_TIMER_LOOP_STOPPED | total_loops={loop_count}")
     
     # =====================================================
     # CONNECTION MANAGEMENT
@@ -355,12 +327,12 @@ class BaseSite:
         return False
     
     # =====================================================
-    # SAVE PRODUCT - THE MAIN METHOD ALL SITES CALL
+    # SAVE PRODUCT - USING BATCHMANAGER
     # =====================================================
     
     def _save_new_product(self, product: Dict, product_id: str) -> bool:
         """
-        Save ONLY new product using batching.
+        Save ONLY new product using BatchManager.
         This is the MAIN method that all sites should call.
         """
         logger.info(f"SAVE_NEW_PRODUCT_CALLED | {self.name} | product_id={product_id} | instance_id={id(self)}")
@@ -384,12 +356,15 @@ class BaseSite:
         else:
             logger.warning(f"{self.name} | REDIS_SAVE_FAILED | {product_id}")
         
-        # STEP 2: ADD TO BATCH FOR POSTGRESQL
-        batch_added = self._add_to_batch(product)
+        # =====================================================
+        # STEP 2: ADD TO BATCH MANAGER (Centralized batching)
+        # =====================================================
+        site_key = self.name.lower()
+        batch_added = self._batch_manager.add_product(site_key, product, product_id)
+        
         if batch_added:
-            with self._batch_lock:
-                batch_size = len(self.pending_products)
-            logger.debug(f"{self.name} | BATCH_QUEUED | {product_id} | queue={batch_size}")
+            pending = self._batch_manager.get_pending_count(site_key)
+            logger.debug(f"{self.name} | BATCH_QUEUED | {product_id} | queue={pending}")
         else:
             logger.warning(f"{self.name} | BATCH_QUEUE_FAILED | {product_id}")
         
@@ -426,8 +401,10 @@ class BaseSite:
             }
             
             self.cache.set_product(self.name.lower(), product_id, cache_payload, ttl=None)
-            with self._batch_lock:
-                self.stats['redis_saved'] += 1
+            
+            # Update stats
+            self.stats['redis_saved'] += 1
+            
             return True
                 
         except Exception as e:
@@ -435,187 +412,16 @@ class BaseSite:
             return False
     
     # =====================================================
-    # BATCHING METHODS - THE CORE LOGIC
+    # BATCHING METHODS - Delegated to BatchManager
     # =====================================================
     
-    def _add_to_batch(self, product_data: dict) -> bool:
-        """Add product to pending batch."""
-        with self._batch_lock:
-            self.pending_products.append(product_data)
-            self._product_counter += 1
-            self.stats['current_product'] = product_data.get('main_product_id', '')
-            
-            if len(self.pending_products) >= self.batch_size:
-                logger.info(f"{self.name} | BATCH_FULL | {len(self.pending_products)} products | flushing...")
-                return self._flush_batch_locked()
-            
-            return True
+    def get_pending_batch_size(self) -> int:
+        """Get the number of pending products for this site."""
+        return self._batch_manager.get_pending_count(self.name.lower())
     
-    def _flush_batch(self) -> bool:
-        """
-        Public flush method - checks if lock is already held.
-        """
-        logger.info(f"FLUSH_BATCH_CALLED | {self.name} | thread={threading.current_thread().name} | instance_id={id(self)}")
-        
-        # Check if we already have the lock (called from flush_pending_batch)
-        if self._batch_lock._is_owned():
-            logger.info(f"FLUSH_BATCH_LOCK_ALREADY_HELD | {self.name}")
-            return self._flush_batch_locked()
-        else:
-            logger.info(f"FLUSH_BATCH_ACQUIRING_LOCK | {self.name}")
-            with self._batch_lock:
-                return self._flush_batch_locked()
-    
-    def _flush_batch_locked(self) -> bool:
-        """
-        Internal flush method - assumes lock is already acquired.
-        """
-        logger.info(f"FLUSH_BATCH_LOCKED_ENTER | {self.name} | thread={threading.current_thread().name}")
-        
-        if not self.pending_products:
-            logger.info(f"FLUSH_BATCH_EMPTY | {self.name}")
-            return True
-        
-        batch_size = len(self.pending_products)
-        logger.info(f"FLUSH_BATCH_COPY | {self.name} | {batch_size} products")
-        
-        batch_copy = self.pending_products.copy()
-        self.pending_products = []
-        self._last_batch_flush = time.time()
-        self._flush_count += 1
-        
-        try:
-            # Ensure connections are initialized
-            logger.info(f"FLUSH_BATCH_CONNECTION_CHECK | {self.name}")
-            
-            if not self._ensure_connections():
-                logger.error(f"FLUSH_BATCH_CONNECTION_ERROR | {self.name}")
-                with self._batch_lock:
-                    self.pending_products = batch_copy + self.pending_products
-                return False
-            
-            if self.db is None:
-                logger.error(f"FLUSH_BATCH_DB_NONE | {self.name}")
-                with self._batch_lock:
-                    self.pending_products = batch_copy + self.pending_products
-                return False
-            
-            logger.info(f"FLUSH_BATCH_CONNECTION_OK | {self.name} | db={self.db is not None}")
-            
-            # Log the first few products for debugging
-            first_products = []
-            for p in batch_copy[:5]:
-                first_products.append(p.get('main_product_id', 'unknown'))
-            logger.info(f"FLUSH_BATCH_PRODUCTS | {self.name} | first_5={first_products}")
-            
-            # Make JSON serializable
-            serialized_batch = []
-            for idx, p in enumerate(batch_copy):
-                if p:
-                    try:
-                        serialized = self._make_json_serializable(p)
-                        if serialized:
-                            serialized_batch.append(serialized)
-                    except Exception as e:
-                        logger.error(f"FLUSH_BATCH_SERIALIZE_ERROR | {self.name} | index {idx} | {e}")
-            
-            logger.info(f"FLUSH_BATCH_SERIALIZED | {self.name} | {len(serialized_batch)} valid products")
-
-            if not serialized_batch:
-                logger.warning(f"FLUSH_BATCH_NO_VALID | {self.name}")
-                return True
-            
-            # =====================================================
-            # ACTUAL DB SAVE
-            # =====================================================
-            logger.info(f"FLUSH_BATCH_SAVING | {self.name} | {len(serialized_batch)} products to DB | flush_count={self._flush_count}")
-            logger.info("=" * 60)
-            
-            try:
-                result = self.db.upsert_products(serialized_batch)
-                logger.info(f"FLUSH_BATCH_RESULT | {self.name} | upsert_products returned: {result}")
-                
-                with self._batch_lock:
-                    self.stats['postgres_saved'] += result
-                    self.stats['new_products'] += result
-                
-                logger.info(f"FLUSH_BATCH_SUCCESS | {self.name} | {result}/{len(serialized_batch)} products saved to DB")
-                logger.info("=" * 60)
-                return True
-                
-            except Exception as db_error:
-                logger.error(f"FLUSH_BATCH_DB_ERROR | {self.name} | {db_error}")
-                import traceback
-                traceback.print_exc()
-                with self._batch_lock:
-                    self.pending_products = batch_copy + self.pending_products
-                return False
-            
-        except Exception as e:
-            logger.error(f"FLUSH_BATCH_ERROR | {self.name} | {e}")
-            import traceback
-            traceback.print_exc()
-            
-            with self._batch_lock:
-                self.pending_products = batch_copy + self.pending_products
-            
-            return self._fallback_individual_save(batch_copy)
-    
-    def _fallback_individual_save(self, products: List[Dict]) -> bool:
-        """Fallback: save products individually if batch fails."""
-        success = True
-        failed_products = []
-        
-        if not self._ensure_connections():
-            logger.error(f"{self.name} | FALLBACK_CONNECTION_ERROR")
-            return False
-        
-        logger.info(f"{self.name} | FALLBACK_SAVE | saving {len(products)} products individually")
-        
-        for product in products:
-            if not product:
-                continue
-            try:
-                if self.db:
-                    serialized = self._make_json_serializable(product)
-                    result = self.db.upsert_products([serialized])
-                    if result > 0:
-                        with self._batch_lock:
-                            self.stats['postgres_saved'] += 1
-                            self.stats['new_products'] += 1
-                    else:
-                        failed_products.append(product)
-                        success = False
-                else:
-                    failed_products.append(product)
-                    success = False
-            except Exception as e:
-                failed_products.append(product)
-                success = False
-                logger.error(f"{self.name} | INDIVIDUAL_SAVE_ERROR | {e}")
-        
-        if failed_products:
-            logger.error(f"{self.name} | FAILED_PRODUCTS | {len(failed_products)}")
-            self._log_failed_products(failed_products)
-        
-        return success
-    
-    def _log_failed_products(self, products: list):
-        """Log failed products to file."""
-        try:
-            os.makedirs("logs", exist_ok=True)
-            with open(f"logs/failed_products_{self.name}_{datetime.now().strftime('%Y%m%d')}.log", "a") as f:
-                f.write(f"\n{'='*60}\n")
-                f.write(f"Timestamp: {datetime.now().isoformat()}\n")
-                f.write(f"Site: {self.name}\n")
-                f.write(f"Failed Products: {len(products)}\n")
-                for p in products[:10]:
-                    f.write(f"  - {json.dumps(p, default=str)[:200]}\n")
-                if len(products) > 10:
-                    f.write(f"  ... and {len(products) - 10} more\n")
-                f.write(f"{'='*60}\n")
-        except:
-            pass
+    def flush_pending_batch(self) -> bool:
+        """Flush pending batch for this site."""
+        return self._batch_manager.flush_site(self.name.lower())
     
     def _make_json_serializable(self, obj: Any) -> Any:
         """Convert non-serializable objects to JSON serializable format."""
@@ -633,34 +439,6 @@ class BaseSite:
             return str(obj)
         except:
             return None
-    
-    def flush_pending_batch(self) -> bool:
-        """Flush pending batch (called on shutdown)."""
-        if not hasattr(self, '_batch_lock'):
-            logger.warning(f"{self.name} | NO_BATCH_LOCK | Skipping flush")
-            return True
-        
-        # Check if we already have the lock
-        if self._batch_lock._is_owned():
-            logger.info(f"{self.name} | FLUSHING_PENDING_LOCKED | {len(self.pending_products)} products")
-            return self._flush_batch_locked()
-        else:
-            with self._batch_lock:
-                if self.pending_products:
-                    logger.info(f"{self.name} | FLUSHING_PENDING | {len(self.pending_products)} products")
-                    return self._flush_batch_locked()
-                return True
-    
-    def get_pending_batch_size(self) -> int:
-        """Get the number of products waiting in the batch."""
-        with self._batch_lock:
-            return len(self.pending_products)
-    
-    def stop_timer_and_flush(self) -> bool:
-        """Stop the timer and flush any remaining products."""
-        logger.info(f"{self.name} | STOPPING_TIMER_AND_FLUSHING")
-        self._stop_batch_timer()
-        return self.flush_pending_batch()
     
     # =====================================================
     # PROGRESS TRACKING METHODS
@@ -722,32 +500,28 @@ class BaseSite:
     
     def get_stats(self) -> Dict:
         """Get current stats."""
-        with self._batch_lock:
-            return self.stats.copy()
+        return self.stats.copy()
     
     def reset_stats(self):
         """Reset all stats for a new cycle."""
-        with self._batch_lock:
-            self.stats = {
-                'new_products': 0,
-                'skipped_duplicates': 0,
-                'errors': 0,
-                'redis_saved': 0,
-                'postgres_saved': 0,
-                'total_products_found': 0,
-                'total_categories': 0,
-                'completed_categories': 0,
-                'current_category': '',
-                'current_product': '',
-                'current_page': 0,
-                'total_pages': 0,
-                'category_progress': 0
-            }
-            self.pending_products = []
-            self._product_counter = 0
-            self.current_category_index = 0
-            self.total_categories_count = 0
-            self.category_page_count = 0
+        self.stats = {
+            'new_products': 0,
+            'skipped_duplicates': 0,
+            'errors': 0,
+            'redis_saved': 0,
+            'postgres_saved': 0,
+            'total_products_found': 0,
+            'total_categories': 0,
+            'completed_categories': 0,
+            'current_category': '',
+            'current_product': '',
+            'current_page': 0,
+            'total_pages': 0,
+            'category_progress': 0
+        }
+        self.current_category_index = 0
+        self.total_categories_count = 0
+        self.category_page_count = 0
     
     def get_connection_status(self) -> Dict[str, bool]:
         """Get current connection status."""
@@ -759,11 +533,15 @@ class BaseSite:
     
     def log_final_summary(self, results: List[Dict]):
         """Log final summary of what was saved."""
+        # Get stats from BatchManager
+        site_stats = self._batch_manager.get_stats(self.name.lower())
+        
         total_new = self.stats.get('new_products', 0)
         total_skipped = self.stats.get('skipped_duplicates', 0)
         total_errors = self.stats.get('errors', 0)
         redis_saved = self.stats.get('redis_saved', 0)
-        postgres_saved = self.stats.get('postgres_saved', 0)
+        postgres_saved = site_stats.get('saved', 0) if site_stats else 0
+        pending = self.get_pending_batch_size()
         
         logger.info("=" * 60)
         logger.info(f"FINAL SUMMARY | {self.name}")
@@ -775,13 +553,10 @@ class BaseSite:
         logger.info(f"  Redis saves: {redis_saved}")
         logger.info(f"  PostgreSQL saves: {postgres_saved}")
         
-        # Log any pending products that weren't saved
-        with self._batch_lock:
-            pending = len(self.pending_products)
-            if pending > 0:
-                logger.warning(f"  PENDING PRODUCTS: {pending} (not saved!)")
-                for p in self.pending_products[:5]:
-                    logger.warning(f"    - {p.get('main_product_id', 'unknown')}")
+        if pending > 0:
+            logger.warning(f"  ⚠️ PENDING PRODUCTS: {pending} (not saved!)")
+        else:
+            logger.info(f"  ✅ No pending products")
         
         logger.info("=" * 60)
     
@@ -800,3 +575,25 @@ class BaseSite:
 
     def extract_categories(self):
         raise NotImplementedError
+
+
+# =====================================================
+# SHUTDOWN HOOK
+# =====================================================
+
+def shutdown_batch_manager_hook():
+    """Shutdown hook for BatchManager."""
+    try:
+        shutdown_batch_manager()
+        logger.info("BASE_SITE | BATCH_MANAGER_SHUTDOWN | complete")
+    except Exception as e:
+        logger.error(f"BASE_SITE | BATCH_MANAGER_SHUTDOWN_ERROR | {e}")
+
+
+# Register shutdown hook
+try:
+    from core.shutdown_handler import register_shutdown_hook
+    register_shutdown_hook(shutdown_batch_manager_hook, "batch_manager_shutdown")
+    logger.info("BASE_SITE | BATCH_MANAGER_SHUTDOWN_HOOK | registered")
+except Exception as e:
+    logger.warning(f"BASE_SITE | BATCH_MANAGER_SHUTDOWN_HOOK_ERROR | {e}")

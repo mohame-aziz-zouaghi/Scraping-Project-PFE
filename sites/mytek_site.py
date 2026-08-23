@@ -44,17 +44,6 @@ class MytekSite(BaseSite):
             self.start_time,
             lambda: self.total_products
         )
-
-        self.set_requester_config(
-            requests_per_minute=100,
-            max_retries=4,
-            timeout=45,
-            use_session=True,
-            use_referer=True,
-            delay_between_requests=(0.5, 2.0),
-            use_basic_headers = True
-
-        )
         
         # =====================================================
         # BATCH CONFIGURATION - Use parent's batching
@@ -62,13 +51,15 @@ class MytekSite(BaseSite):
         self.batch_size = 50
 
     def get_requester_config(self) -> Dict:
+        """Mytek-specific requester configuration - loaded ONCE during init"""
         return {
-            "requests_per_minute": 50,
-            "max_retries": 3,
-            "timeout": 30,
+            "requests_per_minute": 100,
+            "max_retries": 4,
+            "timeout": 45,
             "use_session": True,
             "use_referer": True,
-            "delay_between_requests": (0.5, 1.5),
+            "delay_between_requests": (0.5, 2.0),
+            "use_basic_headers": True,  # Mytek needs basic headers
         }
 
     def _add_error(self, error_msg: str):
@@ -439,6 +430,8 @@ class MytekSite(BaseSite):
     # FULL SCRAPER
     # =====================================================
 
+    # sites/mytek.py - Updated scrape_site
+
     def scrape_site(self):
         logger.info(f"{self.name} | SCRAPE_START")
         log_global(f"{self.name} | SCRAPE_START")
@@ -459,6 +452,27 @@ class MytekSite(BaseSite):
             logger.info(f"{self.name} | DASHBOARD_RESET | new cycle")
         except Exception as e:
             logger.debug(f"{self.name} | DASHBOARD_RESET_ERROR | {e}")
+        
+        # =====================================================
+        # FIX: Initialize connections BEFORE scraping
+        # =====================================================
+        try:
+            if not self._init_connections():
+                logger.error(f"{self.name} | CONNECTION_FAILED")
+                return {
+                    "site": self.name,
+                    "total_products": 0,
+                    "products": [],
+                    "stats": self.stats
+                }
+        except Exception as e:
+            logger.error(f"{self.name} | CONNECTION_ERROR | {e}")
+            return {
+                "site": self.name,
+                "total_products": 0,
+                "products": [],
+                "stats": self.stats
+            }
         
         self.stats = {
             "new_products": 0,

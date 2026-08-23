@@ -49,18 +49,6 @@ class MytekSite(BaseSite):
         # =====================================================
         self.batch_size = 50
         
-        # =====================================================
-        # CONFIGURE SMART REQUESTER FOR MYTEK
-        # =====================================================
-        self.set_requester_config(
-            site_name="mytek",
-            requests_per_minute=20,
-            max_retries=4,
-            timeout=45,
-            use_session=True,
-            use_referer=True,
-            delay_between_requests=(0.5, 2.0)
-        )
 
     def get_requester_config(self) -> Dict:
         """Override to provide Mytek-specific requester config"""

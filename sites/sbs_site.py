@@ -65,22 +65,10 @@ class SBSSite(BaseSite):
         self.dup_counts = {}
         self.dup_total = 0
         
-        # =====================================================
-        # CONFIGURE SMART REQUESTER FOR SBS
-        # =====================================================
-        self.set_requester_config(
-            requests_per_minute=20,
-            max_retries=4,
-            timeout=45,
-            use_session=True,
-            use_referer=True,
-            delay_between_requests=(0.5, 2.0)
-        )
 
     def get_requester_config(self) -> Dict:
-        """Override to provide SBS-specific requester config"""
         return {
-            "requests_per_minute": 20,
+            "requests_per_minute": 100,
             "max_retries": 4,
             "timeout": 45,
             "use_session": True,
@@ -255,6 +243,7 @@ class SBSSite(BaseSite):
             # Validate - allow price 0 for SBS
             if not details.get("name"):
                 logger.warning(f"{self.name} | DETAILS_NO_NAME | {product_id}")
+                logger.warning(f"name of the product : {details.get("name")} | url : {product_url}")
                 with self.lock:
                     self.stats["errors"] += 1
                 return None

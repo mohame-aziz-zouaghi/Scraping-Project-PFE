@@ -38,14 +38,6 @@ class TunisiaNetSite(BaseSite):
         self.base_url = "https://www.tunisianet.com.tn"
         self.search_url = "https://www.tunisianet.com.tn/recherche"
 
-        self.set_requester_config(
-            requests_per_minute=100,
-            max_retries=4,
-            timeout=45,
-            use_session=True,
-            use_referer=True,
-            delay_between_requests=(0.5, 2.0)
-        )
 
         self.lock = threading.Lock()
         self.seen_products: Set[str] = set()
@@ -64,7 +56,7 @@ class TunisiaNetSite(BaseSite):
             "timeout": 45,
             "use_session": True,
             "use_referer": True,
-            "delay_between_requests": (0.5, 2.0),
+            "delay_between_requests": (0.5, 2.5),
         }
 
     def _add_error(self, error_msg: str):

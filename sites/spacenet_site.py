@@ -47,28 +47,17 @@ class SpacenetSite(BaseSite):
         self.products_processed = 0
         self.batch_count = 0
         
-        # =====================================================
-        # CONFIGURE SMART REQUESTER FOR SPACENET
-        # =====================================================
-        self.set_requester_config(
-            requests_per_minute=20,
-            max_retries=4,
-            timeout=45,
-            use_session=True,
-            use_referer=True,
-            delay_between_requests=(0.5, 2.0),
-            use_basic_headers = True
-        )
 
     def get_requester_config(self) -> Dict:
-        """Override to provide Spacenet-specific requester config"""
+        """Spacenet-specific requester configuration - loaded ONCE during init"""
         return {
-            "requests_per_minute": 20,
+            "requests_per_minute": 100,
             "max_retries": 4,
             "timeout": 45,
             "use_session": True,
             "use_referer": True,
-            "delay_between_requests": (0.5, 2.0),
+            "delay_between_requests": (0.5, 2.5),
+            "use_basic_headers": True,  # Spacenet needs basic headers
         }
 
     def _add_error(self, error_msg: str):
