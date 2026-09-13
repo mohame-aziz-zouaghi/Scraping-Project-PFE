@@ -22,6 +22,151 @@ logger = setup_logger("tunisianet_parser", "scraper")
 
 
 # =====================================================
+# JSON CLEANING AND SAFE LOADING
+# =====================================================
+
+def clean_json_data(raw_data: str) -> str:
+    """
+    Clean malformed JSON data by removing control characters and fixing common issues.
+    """
+    if not raw_data:
+        return ""
+    
+    # Remove control characters (except valid whitespace)
+    raw_data = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', raw_data)
+    
+    # Fix unescaped newlines and tabs within strings
+    raw_data = re.sub(r'(?<!\\)\n', '\\n', raw_data)
+    raw_data = re.sub(r'(?<!\\)\r', '\\r', raw_data)
+    raw_data = re.sub(r'(?<!\\)\t', '\\t', raw_data)
+    
+    # Remove trailing commas before closing braces/brackets
+    raw_data = re.sub(r',\s*}', '}', raw_data)
+    raw_data = re.sub(r',\s*]', ']', raw_data)
+    
+    # Fix missing commas between array elements
+    raw_data = re.sub(r'}\s*{', '},{', raw_data)
+    
+    return raw_data
+
+
+def safe_json_loads(text: str) -> Optional[Dict]:
+    """
+    Safely load JSON from string with multiple fallback attempts.
+    """
+    if not text:
+        return None
+    
+    # Try 1: Clean with clean_json_string first
+    try:
+        cleaned = clean_json_string(text)
+        return json.loads(cleaned)
+    except json.JSONDecodeError as e:
+        logger.debug(f"JSON_PARSE_ERROR_CLEAN_JSON_STRING | {e}")
+    
+    # Try 2: Clean control characters
+    try:
+        cleaned = clean_json_data(text)
+        return json.loads(cleaned)
+    except json.JSONDecodeError as e:
+        logger.debug(f"JSON_PARSE_ERROR_CLEAN_DATA | {e}")
+    
+    # Try 3: Regex extraction fallback
+    try:
+        return _extract_product_from_json(text)
+    except Exception as e:
+        logger.debug(f"JSON_REGEX_EXTRACTION_FAILED | {e}")
+    
+    return None
+
+
+def _extract_product_from_json(text: str) -> Optional[Dict]:
+    """
+    Extract critical product data from malformed JSON using regex.
+    """
+    result = {}
+    
+    # Extract ID
+    id_match = re.search(r'"id"\s*:\s*(\d+)', text)
+    if id_match:
+        result["id"] = id_match.group(1)
+    
+    # Extract name
+    name_match = re.search(r'"name"\s*:\s*"([^"]*)"', text)
+    if name_match:
+        result["name"] = name_match.group(1)
+    
+    # Extract price
+    price_match = re.search(r'"price"\s*:\s*"([^"]*)"', text)
+    if price_match:
+        result["price"] = price_match.group(1)
+    
+    # Extract manufacturer
+    manufacturer_match = re.search(r'"manufacturer_name"\s*:\s*"([^"]*)"', text)
+    if manufacturer_match:
+        result["manufacturer_name"] = manufacturer_match.group(1)
+    
+    # Extract availability
+    availability_match = re.search(r'"availability"\s*:\s*"([^"]*)"', text)
+    if availability_match:
+        result["availability"] = availability_match.group(1)
+    
+    # Extract quantity
+    quantity_match = re.search(r'"quantity"\s*:\s*(\d+)', text)
+    if quantity_match:
+        result["quantity"] = quantity_match.group(1)
+    
+    # Extract reference
+    reference_match = re.search(r'"reference"\s*:\s*"([^"]*)"', text)
+    if reference_match:
+        result["reference"] = reference_match.group(1)
+    
+    return result if result.get("id") or result.get("name") else None
+
+
+def extract_json_from_data_product(data_product: str) -> Optional[Dict]:
+    """
+    Extract and parse the data-product JSON attribute with proper error handling.
+    """
+    if not data_product:
+        return None
+    
+    # First try HTML unescaping
+    try:
+        import html
+        unescaped = html.unescape(data_product)
+        result = safe_json_loads(unescaped)
+        if result:
+            return result
+    except Exception as e:
+        logger.debug(f"HTML_UNESCAPE_FAILED | {e}")
+    
+    # Try direct parsing
+    result = safe_json_loads(data_product)
+    if result:
+        return result
+    
+    # Try with additional cleaning (remove HTML entities)
+    try:
+        import html
+        cleaned = html.unescape(data_product)
+        # Remove any remaining HTML tags
+        cleaned = re.sub(r'<[^>]+>', '', cleaned)
+        # Fix any unescaped quotes
+        cleaned = re.sub(r'(?<!\\)"', '\\"', cleaned)
+        # Try to wrap in quotes if needed
+        if not cleaned.startswith('{') and not cleaned.startswith('['):
+            cleaned = f'{{"{cleaned}"}}'
+        result = safe_json_loads(cleaned)
+        if result:
+            return result
+    except Exception as e:
+        logger.debug(f"ADDITIONAL_CLEANING_FAILED | {e}")
+    
+    return None
+
+
+# =====================================================
 # PRICE EXTRACTION (SITE-SPECIFIC)
 # =====================================================
 
@@ -259,18 +404,19 @@ def parse_tunisianet_product_page(html: str, url: str, site: str, main_product_i
         logger.warning(f"{site} | NO_PRODUCT_DETAILS | {url}")
         return None
 
-    # Extract JSON
+    # Extract JSON with improved error handling
     data = {}
     if product_div and product_div.has_attr("data-product"):
         try:
             raw_data = product_div["data-product"]
-            raw_data = clean_json_string(raw_data)
-            data = json.loads(raw_data)
-            logger.debug(f"{site} | JSON_EXTRACTED | {url}")
-        except json.JSONDecodeError as e:
-            logger.warning(f"{site} | JSON_PARSE_ERROR | {e}")
+            extracted_data = extract_json_from_data_product(raw_data)
+            if extracted_data:
+                data = extracted_data
+                logger.debug(f"{site} | JSON_EXTRACTED | {url}")
+            else:
+                logger.warning(f"{site} | JSON_EXTRACT_FAILED | {url}")
         except Exception as e:
-            logger.warning(f"{site} | JSON_EXTRACT_ERROR | {e}")
+            logger.warning(f"{site} | JSON_EXTRACT_ERROR | {e} | {url}")
 
     # Extract product ID
     if not main_product_id:
@@ -288,7 +434,7 @@ def parse_tunisianet_product_page(html: str, url: str, site: str, main_product_i
     # Initialize product
     product = create_product_schema(site, url, main_product_id)
 
-    # Name
+    # ─── NAME ─────────────────────────────────────────────────────
     raw_name = data.get("name", "")
     product["name"] = clean_product_name(raw_name)
     
@@ -301,7 +447,7 @@ def parse_tunisianet_product_page(html: str, url: str, site: str, main_product_i
         logger.warning(f"{site} | NO_PRODUCT_NAME | {url}")
         return None
     
-    # Brand
+    # ─── BRAND ──────────────────────────────────────────────────
     manufacturer_name = data.get("manufacturer_name")
     if manufacturer_name:
         product["brand"] = clean_brand_name(manufacturer_name)
@@ -316,7 +462,7 @@ def parse_tunisianet_product_page(html: str, url: str, site: str, main_product_i
         if meta_brand:
             product["brand"] = clean_brand_name(meta_brand.get("content", ""))
 
-    # Category
+    # ─── CATEGORY ───────────────────────────────────────────────
     category_name = data.get("category_name", "")
     product["category"] = clean_category_name(category_name)
     
@@ -329,14 +475,14 @@ def parse_tunisianet_product_page(html: str, url: str, site: str, main_product_i
                     product["category"] = clean_category_name(cat_text)
                     break
     
-    # Special ID
+    # ─── SPECIAL ID ─────────────────────────────────────────────
     raw_special_id = data.get("reference", "")
     product["special_id"] = clean_special_id(raw_special_id)
     
     if not product["special_id"] and main_product_id:
         product["special_id"] = clean_special_id(str(main_product_id))
 
-    # Prices
+    # ─── PRICES ──────────────────────────────────────────────────
     prices = parse_prices(data, soup)
     
     product["price"] = prices.get("price", 0.0)
@@ -348,7 +494,7 @@ def parse_tunisianet_product_page(html: str, url: str, site: str, main_product_i
         logger.warning(f"{site} | NO_PRICE | {url} | price={product['price']}")
         return None
 
-    # Description
+    # ─── DESCRIPTION ────────────────────────────────────────────
     short_desc_html = data.get("description_short")
     if short_desc_html:
         try:
@@ -366,7 +512,7 @@ def parse_tunisianet_product_page(html: str, url: str, site: str, main_product_i
             except:
                 product["description"] = ""
 
-    # Features
+    # ─── FEATURES ───────────────────────────────────────────────
     features = data.get("features", [])
     product["short_description"] = parse_features_to_short_description(features)
 
@@ -382,7 +528,7 @@ def parse_tunisianet_product_page(html: str, url: str, site: str, main_product_i
                     if name and value and not is_empty_or_placeholder(name) and not is_empty_or_placeholder(value):
                         product["short_description"].append(f"{name}: {value}")
 
-    # Images
+    # ─── IMAGES ──────────────────────────────────────────────────
     images_list, main_image = extract_images_from_data(data)
     product["images"] = images_list
     product["main_image"] = main_image
@@ -399,7 +545,7 @@ def parse_tunisianet_product_page(html: str, url: str, site: str, main_product_i
                 if not product["main_image"]:
                     product["main_image"] = src
 
-    # Availability
+    # ─── AVAILABILITY ───────────────────────────────────────────
     availability_text = None
     
     if data.get("availability_message"):
@@ -419,7 +565,7 @@ def parse_tunisianet_product_page(html: str, url: str, site: str, main_product_i
     
     product["availability"] = normalize_availability(availability_text)
 
-    # Price valid until
+    # ─── PRICE VALID UNTIL ──────────────────────────────────────
     price_valid_until = data.get("price_valid_until") or data.get("valid_until")
     
     if price_valid_until:
@@ -429,7 +575,7 @@ def parse_tunisianet_product_page(html: str, url: str, site: str, main_product_i
         product["price_valid_until"] = default_valid_until
         logger.debug(f"{site} | PRICE_VALID_UNTIL_DEFAULT_SET | {default_valid_until}")
 
-    # Additional metadata
+    # ─── ADDITIONAL METADATA ────────────────────────────────────
     product["reference"] = data.get("reference")
     product["ean"] = data.get("ean13")
     product["upc"] = data.get("upc")
@@ -458,7 +604,7 @@ def parse_tunisianet_product_page(html: str, url: str, site: str, main_product_i
 def fast_check_tunisianet_product(url: str, product_id: str = None) -> Optional[Dict[str, Any]]:
     """Quick check function for Tunisianet products."""
     from core.Web.http_client import get
-    
+        
     try:
         html = get(
             url=url,

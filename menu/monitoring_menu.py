@@ -10,7 +10,16 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.logger import setup_logger
 from core.console_manager import get_console, open_python_script_terminal, Colors
-from monitoring.engine.site_registry import register_all_sites, get_all_sites, print_registry_status
+from monitoring.config import (
+    get_enabled_sites,
+    get_all_sites,
+    get_site_config,
+    get_worker,
+    set_site_enabled,
+    update_site_config,
+    print_registry_status,
+    toggle_site  # Add if you need toggle functionality
+)
 
 logger = setup_logger("monitoring_menu", "cli")
 console = get_console()
@@ -65,18 +74,22 @@ def confirm_action(message):
 def open_monitoring_dashboard(mode="interactive"):
     """Open monitoring dashboard in a new terminal window"""
     script_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 
-                               "monitoring", "run_monitor.py")
+                               "monitoring", "run.py")
     
     console.print("", Colors.CYAN)
     console.print(f"  🚀 Launching Monitoring System in new terminal...", Colors.CYAN)
     console.print("  │  This will open a separate window", Colors.DIM)
     console.print("  │  The monitoring dashboard will appear there", Colors.DIM)
-    console.print("  │  Type 'help' for commands", Colors.DIM)
+    console.print("  │  Press Ctrl+C to stop all sites", Colors.DIM)
     console.print("  └─", Colors.DIM)
+    
+    args = []
+    if mode == "headless":
+        args.append("--headless")
     
     success = open_python_script_terminal(
         script_path, 
-        ["--mode", mode], 
+        args, 
         "📊 Monitoring System"
     )
     
@@ -84,13 +97,12 @@ def open_monitoring_dashboard(mode="interactive"):
         print_success("Monitoring console opened in new window")
     else:
         print_warning("Could not open new console. Running in current window...")
-        from monitoring.run_monitor import run_interactive_mode 
-        if mode == "interactive":
-            from monitoring.run_monitor import run_interactive_mode
-            run_interactive_mode()
-        else:
-            from monitoring.run_monitor import run_headless_mode
-            run_headless_mode()
+        from monitoring.run import main as run_main
+        import sys
+        sys.argv = ["run.py"]
+        if mode == "headless":
+            sys.argv.append("--headless")
+        run_main()
     
     input("\n  Press Enter to continue...")
 
@@ -103,9 +115,12 @@ def run_all_sites_headless():
     console.print("  │  Press Ctrl+C to stop monitoring", Colors.DIM)
     console.print("  └─", Colors.DIM)
     
-    from monitoring.run_monitor import run_headless_mode
+    from monitoring.run import main as run_main
+    import sys
+    sys.argv = ["run.py", "--headless"]
+    
     try:
-        run_headless_mode()
+        run_main()
     except KeyboardInterrupt:
         console.print("", Colors.RED)
         console.print("  🛑 Monitoring stopped by user", Colors.RED)
@@ -115,7 +130,6 @@ def run_all_sites_headless():
 
 def run_single_site():
     """Run monitoring for a single site"""
-    register_all_sites()
     sites = get_all_sites()
     
     if not sites:
@@ -126,11 +140,12 @@ def run_single_site():
     console.print("  ┌─ SELECT SITE TO MONITOR", Colors.BOLD + Colors.CYAN)
     
     for i, site in enumerate(sites, 1):
-        from monitoring.engine.site_registry import get_site_config
         config = get_site_config(site)
         enabled = config.get("enabled", True)
         status = "✅" if enabled else "⏸️"
-        console.print(f"  │  {i}. {status} {site.upper()}", Colors.WHITE)
+        worker = get_worker(site)
+        worker_status = "🔧" if worker else "❌"
+        console.print(f"  │  {i}. {status} {worker_status} {site.upper()}", Colors.WHITE)
     
     console.print("  │  0. Back", Colors.DIM)
     console.print(f"  └─{'─' * 30}", Colors.DIM)
@@ -145,7 +160,6 @@ def run_single_site():
         if 0 <= idx < len(sites):
             site = sites[idx]
             
-            from monitoring.engine.site_registry import get_site_config, update_site_config
             current_config = get_site_config(site)
             
             console.print("", Colors.CYAN)
@@ -170,9 +184,12 @@ def run_single_site():
             console.print("  │  Press Ctrl+C to stop", Colors.DIM)
             console.print("  └─", Colors.DIM)
             
-            from monitoring.run_monitor import run_single_site_mode
+            from monitoring.run import main as run_main
+            import sys
+            sys.argv = ["run.py", "--site", site]
+            
             try:
-                run_single_site_mode(site, workers, interval)
+                run_main()
             except KeyboardInterrupt:
                 console.print("", Colors.RED)
                 console.print(f"  🛑 Monitoring stopped for {site.upper()}", Colors.RED)
@@ -184,7 +201,6 @@ def run_single_site():
 
 def enable_site():
     """Enable a specific site"""
-    register_all_sites()
     sites = get_all_sites()
     
     if not sites:
@@ -195,7 +211,10 @@ def enable_site():
     console.print("  ┌─ ENABLE SITE", Colors.BOLD + Colors.CYAN)
     
     for i, site in enumerate(sites, 1):
-        console.print(f"  │  {i}. {site.upper()}", Colors.WHITE)
+        config = get_site_config(site)
+        enabled = config.get("enabled", True)
+        status = "✅ ENABLED" if enabled else "⏸️ DISABLED"
+        console.print(f"  │  {i}. {site.upper():12} | {status}", Colors.WHITE)
     
     console.print("  │  0. Back", Colors.DIM)
     console.print(f"  └─{'─' * 30}", Colors.DIM)
@@ -209,9 +228,10 @@ def enable_site():
         idx = int(choice) - 1
         if 0 <= idx < len(sites):
             site = sites[idx]
-            from monitoring.run_monitor import enable_site
-            enable_site(site)
-            print_success(f"{site.upper()} has been enabled")
+            if set_site_enabled(site, True):
+                print_success(f"{site.upper()} has been enabled")
+            else:
+                print_error(f"Failed to enable {site.upper()}")
         else:
             print_error("Invalid selection!")
     except ValueError:
@@ -221,7 +241,6 @@ def enable_site():
 
 def disable_site():
     """Disable a specific site"""
-    register_all_sites()
     sites = get_all_sites()
     
     if not sites:
@@ -232,7 +251,10 @@ def disable_site():
     console.print("  ┌─ DISABLE SITE", Colors.BOLD + Colors.CYAN)
     
     for i, site in enumerate(sites, 1):
-        console.print(f"  │  {i}. {site.upper()}", Colors.WHITE)
+        config = get_site_config(site)
+        enabled = config.get("enabled", True)
+        status = "✅ ENABLED" if enabled else "⏸️ DISABLED"
+        console.print(f"  │  {i}. {site.upper():12} | {status}", Colors.WHITE)
     
     console.print("  │  0. Back", Colors.DIM)
     console.print(f"  └─{'─' * 30}", Colors.DIM)
@@ -246,9 +268,10 @@ def disable_site():
         idx = int(choice) - 1
         if 0 <= idx < len(sites):
             site = sites[idx]
-            from monitoring.run_monitor import disable_site
-            disable_site(site)
-            print_warning(f"{site.upper()} has been disabled")
+            if set_site_enabled(site, False):
+                print_warning(f"{site.upper()} has been disabled")
+            else:
+                print_error(f"Failed to disable {site.upper()}")
         else:
             print_error("Invalid selection!")
     except ValueError:
@@ -258,7 +281,6 @@ def disable_site():
 
 def show_site_config():
     """Show configuration for a specific site"""
-    register_all_sites()
     sites = get_all_sites()
     
     if not sites:
@@ -283,8 +305,13 @@ def show_site_config():
         idx = int(choice) - 1
         if 0 <= idx < len(sites):
             site = sites[idx]
-            from monitoring.run_monitor import show_site_config
-            show_site_config(site)
+            config = get_site_config(site)
+            
+            print(f"\n  📋 CONFIGURATION FOR: {site.upper()}")
+            print("  " + "=" * 50)
+            for key, value in config.items():
+                print(f"     {key:25} : {value}")
+            print("  " + "=" * 50)
         else:
             print_error("Invalid selection!")
     except ValueError:
@@ -294,7 +321,6 @@ def show_site_config():
 
 def update_site_config_menu():
     """Update configuration for a specific site"""
-    register_all_sites()
     sites = get_all_sites()
     
     if not sites:
@@ -320,7 +346,6 @@ def update_site_config_menu():
         if 0 <= idx < len(sites):
             site = sites[idx]
             
-            from monitoring.engine.site_registry import get_site_config
             current_config = get_site_config(site)
             
             console.print("", Colors.CYAN)
@@ -339,9 +364,8 @@ def update_site_config_menu():
                 updates['interval'] = int(interval)
             
             if updates:
-                from monitoring.run_monitor import update_config
                 for key, value in updates.items():
-                    update_config(site, key, str(value))
+                    update_site_config(site, **{key: value})
                 print_success("Configuration updated!")
             else:
                 print_warning("No changes made")
@@ -354,15 +378,33 @@ def update_site_config_menu():
 
 def show_status():
     """Show monitoring system status"""
-    from monitoring.run_monitor import show_status
-    show_status()
+    print_registry_status()
     input("\n  Press Enter to continue...")
 
 
 def list_sites():
     """List all registered sites"""
-    from monitoring.run_monitor import list_sites
-    list_sites()
+    sites = get_all_sites()
+    
+    if not sites:
+        print_error("No sites registered!")
+        return
+    
+    print("\n" + "=" * 60)
+    print("📋 REGISTERED SITES")
+    print("=" * 60)
+    
+    for site in sites:
+        config = get_site_config(site)
+        enabled = config.get("enabled", True)
+        status = "✅ ENABLED" if enabled else "⏸️ DISABLED"
+        workers = config.get("workers", 20)
+        interval = config.get("interval", 300)
+        worker = get_worker(site)
+        worker_status = "✅" if worker else "❌"
+        print(f"   {site.upper():15} | {status:12} | W:{workers} | I:{interval}s | Worker:{worker_status}")
+    
+    print("=" * 60)
     input("\n  Press Enter to continue...")
 
 

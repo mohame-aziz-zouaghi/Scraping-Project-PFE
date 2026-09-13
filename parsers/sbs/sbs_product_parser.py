@@ -1,9 +1,9 @@
-# parsers/sbs/sbs_product_parser.py
+# parsers/sbs/sbs_product_parser.py - UPDATED with redirect detection
 
 import json
 import re
 from bs4 import BeautifulSoup
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Optional, List, Any
 
 from core.logger import setup_logger
@@ -34,122 +34,102 @@ def clean_price_sbs(val: Any) -> Optional[float]:
     return clean_price(val, decimals=2, currency="TND")
 
 
-def clean_json_ld_text(text: str) -> str:
+def clean_json_for_parsing(text: str) -> str:
     """
-    Clean JSON-LD text by removing invalid control characters.
+    Clean JSON string by removing/replacing problematic characters.
     """
     if not text:
         return text
     
-    # Remove invalid control characters (except valid whitespace)
-    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+    # Replace tab characters with spaces
+    text = text.replace('\t', ' ')
     
-    # Fix common unescaped characters in JSON strings
-    text = re.sub(r'(?<!\\)\n', '\\n', text)
-    text = re.sub(r'(?<!\\)\r', '\\r', text)
-    text = re.sub(r'(?<!\\)\t', '\\t', text)
+    # Remove other control characters
+    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
     
     return text
 
 
-def safe_json_loads(text: str) -> Optional[Dict]:
+def is_category_page(soup: BeautifulSoup, url: str) -> bool:
     """
-    Safely load JSON from string with error handling and cleaning.
+    Detect if the page is a category page (not a product page).
+    SBS redirects to category when product is removed.
     """
-    if not text:
-        return None
+    # Check for category page indicators
+    # 1. Check for "Cartes graphiques" or category title
+    category_title = soup.select_one(".page-heading .h1, h1.page-heading")
+    if category_title:
+        # Check if the title contains category words
+        text = category_title.text.lower().strip()
+        # Common category titles: "Cartes graphiques", "Alimentations", etc.
+        # If there's no product name in the title, it's likely a category
+        if "produits" in text or "catégorie" in text or "catégories" in text:
+            return True
+        # If the title has no product-specific words, check other indicators
     
-    # Try normal parsing first
+    # 2. Check for product grid on the page
+    product_grid = soup.select_one(".products, .product-list, .product-grid")
+    if product_grid and not soup.select_one("#product-details, .product-cover"):
+        # If there's a product grid but no product details, it's a category page
+        return True
+    
+    # 3. Check if there are multiple products listed
+    product_items = soup.select(".product-miniature, .product-item, .tvproduct-wrapper")
+    if len(product_items) > 1 and not soup.select_one("#product-details"):
+        return True
+    
+    # 4. Check for "23 produits" text in the page
+    page_text = soup.get_text()
+    if re.search(r'\d+\s+produits?', page_text) and not soup.select_one("#product-details"):
+        return True
+    
+    return False
+
+
+def is_product_redirected(html: str, url: str) -> bool:
+    """
+    Check if the page is a redirect to a category page.
+    """
+    if not html:
+        return False
+    
+    # Check if the URL changed (redirect detection)
+    # Since we get the HTML directly, we need to check content
+    
     try:
-        return json.loads(text)
-    except json.JSONDecodeError as e:
-        logger.debug(f"JSON_PARSE_ERROR | {e}")
-        
-        # Try cleaning and re-parsing
-        try:
-            cleaned = clean_json_ld_text(text)
-            return json.loads(cleaned)
-        except json.JSONDecodeError as e2:
-            logger.debug(f"JSON_PARSE_ERROR_AFTER_CLEANING | {e2}")
-            
-            # Try regex extraction for critical fields
-            try:
-                return _extract_product_from_text(text)
-            except Exception as e3:
-                logger.debug(f"REGEX_EXTRACTION_FAILED | {e3}")
-                return None
-
-
-def _extract_product_from_text(text: str) -> Optional[Dict]:
-    """
-    Extract product data from text using regex as fallback.
-    """
-    result = {}
+        soup = BeautifulSoup(html, "lxml")
+    except Exception:
+        return False
     
-    # Extract name
-    name_match = re.search(r'"name"\s*:\s*"([^"]*)"', text)
-    if name_match:
-        result['name'] = clean_and_decode_text(name_match.group(1))
-    
-    # Extract description
-    desc_match = re.search(r'"description"\s*:\s*"([^"]*)"', text)
-    if desc_match:
-        result['description'] = clean_html(desc_match.group(1))
-    
-    # Extract price
-    price_match = re.search(r'"price"\s*:\s*"([^"]*)"', text)
-    if price_match:
-        result['price'] = clean_price_sbs(price_match.group(1))
-    
-    # Extract sku/mpn
-    sku_match = re.search(r'"sku"\s*:\s*"([^"]*)"', text)
-    if sku_match:
-        result['sku'] = clean_special_id(sku_match.group(1))
-    
-    mpn_match = re.search(r'"mpn"\s*:\s*"([^"]*)"', text)
-    if mpn_match:
-        result['mpn'] = clean_special_id(mpn_match.group(1))
-    
-    # Extract brand
-    brand_match = re.search(r'"brand"\s*:\s*{[^}]*"name"\s*:\s*"([^"]*)"', text)
-    if brand_match:
-        result['brand'] = clean_brand_name(brand_match.group(1))
-    
-    # Extract availability
-    avail_match = re.search(r'"availability"\s*:\s*"([^"]*)"', text)
-    if avail_match:
-        result['availability'] = normalize_availability(avail_match.group(1).split('/')[-1])
-    
-    # Extract price valid until
-    valid_match = re.search(r'"priceValidUntil"\s*:\s*"([^"]*)"', text)
-    if valid_match:
-        result['priceValidUntil'] = clean_date(valid_match.group(1))
-    
-    # Extract category
-    cat_match = re.search(r'"category"\s*:\s*"([^"]*)"', text)
-    if cat_match:
-        result['category'] = clean_category_name(cat_match.group(1))
-    
-    # Extract images
-    image_matches = re.findall(r'"image"\s*:\s*"([^"]*)"', text)
-    if image_matches:
-        result['images'] = [normalize_url(img) for img in image_matches if img]
-    
-    return result if result.get('name') else None
+    # Check if it's a category page
+    return is_category_page(soup, url)
 
 
 def parse_sbs_product_page(html: str, url: str, site: str, main_product_id: Optional[str] = None) -> Optional[Dict]:
     """
-    Parse SBS product page with proper error handling and cleaning using utility methods.
+    Parse SBS product page with redirect detection.
+    Returns None if the product is removed/redirected.
     """
     if not html:
         logger.warning(f"{site} | EMPTY_HTML | {url}")
+        return None
+    
+    # ─── CHECK FOR REDIRECT / CATEGORY PAGE ──────────────────
+    if is_product_redirected(html, url):
+        logger.warning(f"{site} | PRODUCT_REMOVED_REDIRECTED | {url}")
         return None
     
     try:
         soup = BeautifulSoup(html, "lxml")
     except Exception as e:
         logger.error(f"{site} | BEAUTIFULSOUP_ERROR | {url} | {e}")
+        return None
+
+    # ─── CHECK FOR PRODUCT DETAILS ────────────────────────────
+    # If no product details div, it's not a product page
+    product_details = soup.select_one("#product-details, .product-cover, .product-prices")
+    if not product_details:
+        logger.warning(f"{site} | NO_PRODUCT_DETAILS | {url}")
         return None
 
     # Extract product id if not provided
@@ -161,6 +141,12 @@ def parse_sbs_product_page(html: str, url: str, site: str, main_product_id: Opti
                 if "product-id-" in c:
                     main_product_id = c.split("product-id-")[-1]
                     break
+        
+        # Try to extract from URL if still not found
+        if not main_product_id:
+            match = re.search(r'/(\d+)(?:/|$)', url)
+            if match:
+                main_product_id = match.group(1)
 
     # Create product schema
     try:
@@ -170,23 +156,46 @@ def parse_sbs_product_page(html: str, url: str, site: str, main_product_id: Opti
         return None
 
     # =====================================================
-    # PARSE JSON-LD DATA WITH ERROR HANDLING
+    # FIXED: JSON-LD EXTRACTION - HANDLE MALFORMED JSON
     # =====================================================
-    scripts = soup.find_all("script", type="application/ld+json")
     json_data = None
-
+    
+    # Find all JSON-LD scripts
+    scripts = soup.find_all("script", type="application/ld+json")
+    
     for script in scripts:
         if not script.string:
             continue
         
         try:
-            data = safe_json_loads(script.string)
-            if data and data.get("@type") == "Product":
+            # Get the raw script content
+            raw_content = script.string
+            
+            # Clean the content before parsing
+            cleaned_content = clean_json_for_parsing(raw_content)
+            
+            # Parse the JSON
+            data = json.loads(cleaned_content)
+            
+            # Check if it's a Product schema
+            if data.get("@type") == "Product":
                 json_data = data
+                logger.debug(f"{site} | FOUND_PRODUCT_JSON")
                 break
+                
+        except json.JSONDecodeError as e:
+            logger.debug(f"{site} | JSON_DECODE_ERROR | {e}")
+            continue
         except Exception as e:
             logger.debug(f"{site} | JSON_LOAD_ERROR | {e}")
             continue
+
+    # ─── LOG WHAT WAS FOUND (FOR DEBUGGING) ─────────────────────
+    if json_data:
+        logger.debug(f"{site} | PRODUCT_JSON_FOUND | name={json_data.get('name', '')[:30]}")
+    else:
+        logger.warning(f"{site} | NO_PRODUCT_JSON_FOUND | url={url}")
+        return None
 
     # =====================================================
     # EXTRACT DATA FROM JSON
@@ -231,6 +240,9 @@ def parse_sbs_product_page(html: str, url: str, site: str, main_product_id: Opti
                 # Price valid until - using clean_date
                 if offers.get("priceValidUntil"):
                     product["price_valid_until"] = clean_date(offers["priceValidUntil"])
+                else:
+                    # Default: 7 days from now
+                    product["price_valid_until"] = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
                 
                 # Availability - using normalize_availability
                 if offers.get("availability"):
@@ -272,17 +284,17 @@ def parse_sbs_product_page(html: str, url: str, site: str, main_product_id: Opti
                 # price = discounted price (main price)
                 # discount_price = original price (for reference)
                 product["price"] = html_discounted_price
-                product["discount_price"] = json_price
+                product["discount_price"] = json_price if json_price else 0.0
                 
                 if json_price and html_discounted_price:
                     product["discount_amount"] = round(html_discounted_price - json_price, 2)
                 else:
-                    product["discount_amount"] = 0
+                    product["discount_amount"] = 0.0
     
     # If no discount, use JSON price
     if not discount_block:
-        product["discount_price"] = 0
-        product["discount_amount"] = 0
+        product["discount_price"] = 0.0
+        product["discount_amount"] = 0.0
 
     # =====================================================
     # SHORT DESCRIPTION / SPECS - using parse_specs

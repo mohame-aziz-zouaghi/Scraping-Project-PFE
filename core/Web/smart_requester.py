@@ -319,13 +319,19 @@ class SmartRequester:
             ])
         
         return base_referers
+
     
+    # core/web/smart_requester.py - Each instance has independent rate limiting
+
     def _rate_limit(self) -> None:
-        """Intelligent rate limiting with jitter"""
+        """
+        Rate limiting for THIS requester instance only.
+        Each site has its own independent rate limit.
+        """
         with self.rate_limit_lock:
             now = time.time()
             
-            # Clean old timestamps
+            # Clean old timestamps (keep last 60 seconds)
             while self.request_timestamps and now - self.request_timestamps[0] > 60:
                 self.request_timestamps.popleft()
             
@@ -335,11 +341,17 @@ class SmartRequester:
                 oldest = self.request_timestamps[0]
                 wait_time = 60 - (now - oldest)
                 
-                # Add jitter (10-30% variation)
-                jitter = random.uniform(0.1, 0.3)
-                wait_time = wait_time * (1 + jitter)
+                # ─── Cap wait time to prevent freezing ──────────────
+                wait_time = min(wait_time, 1.0)
                 
-                logger.debug(f"Rate limit reached, waiting {wait_time:.2f}s")
+                # ─── Minimal jitter ──────────────────────────────────
+                jitter = random.uniform(0.02, 0.05)
+                wait_time = wait_time * (1 + jitter)
+                wait_time = max(wait_time, 0.05)
+                
+                if wait_time > 0.5:
+                    logger.debug(f"Rate limit ({self.site_name}): waiting {wait_time:.2f}s (rate={current_rate}/{self.requests_per_minute})")
+                
                 time.sleep(wait_time)
             
             self.request_timestamps.append(time.time())

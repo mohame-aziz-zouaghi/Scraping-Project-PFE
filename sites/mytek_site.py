@@ -1,33 +1,36 @@
 # sites/mytek.py
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict
+"""
+Mytek scraper - Properly inherits from BaseSite with full category scraping.
+Fixes the issue where scraping stops after first category.
+"""
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Dict, List, Optional, Any, Set
 from bs4 import BeautifulSoup
+import threading
+import time
+import os
+import json
 
 from config.categoriesMytek import CATEGORIES
 from core.Web.http_client import get
 from core.logger import setup_logger, log_global, write_product_result
-
 from core.performance import PerformanceTracker
 from core.thread_manager import ThreadManager
-
 from parsers.mytek.mytek_search_parser import parse_mytek_products
 from parsers.mytek.mytek_product_parser import parse_mytek_product_page
-
 from config.brands import SEARCH_BRANDS
-
 from sites.base_site import BaseSite
-
-import threading
-import time
-import os
-
 
 logger = setup_logger("mytek", "scraper")
 dup_logger = setup_logger("mytek", "duplication")
 
 
 class MytekSite(BaseSite):
+    """
+    Mytek scraper - Fetches products from Mytek website.
+    Properly inherits from BaseSite for batching, connection management, and progress tracking.
+    """
 
     name = "MYTEK"
     BASE_URL = "https://www.mytek.tn/"
@@ -45,13 +48,18 @@ class MytekSite(BaseSite):
             lambda: self.total_products
         )
         
-        # =====================================================
-        # BATCH CONFIGURATION - Use parent's batching
-        # =====================================================
+        # Batch configuration - use parent's batching
         self.batch_size = 50
+        
+        # Track categories properly
+        self.total_categories_count = len(CATEGORIES)
+        self.completed_categories_count = 0
+        self.current_category_index = 0
+        
+        logger.info(f"{self.name} | INIT_DONE | total_categories={self.total_categories_count}")
 
     def get_requester_config(self) -> Dict:
-        """Mytek-specific requester configuration - loaded ONCE during init"""
+        """Mytek-specific requester configuration."""
         return {
             "requests_per_minute": 100,
             "max_retries": 4,
@@ -63,7 +71,7 @@ class MytekSite(BaseSite):
         }
 
     def _add_error(self, error_msg: str):
-        """Helper method to add error to dashboard"""
+        """Helper method to add error to dashboard."""
         try:
             from scraping.engine.multi_scrape_progress import get_multi_scrape_progress
             progress = get_multi_scrape_progress()
@@ -76,6 +84,7 @@ class MytekSite(BaseSite):
     # =====================================================
     
     def extract_categories(self):
+        """Discover categories from the Mytek website."""
         logger.info(f"{self.name} | CATEGORY_DISCOVERY_START")
         log_global(f"{self.name} | CATEGORY_DISCOVERY_START")
 
@@ -112,7 +121,7 @@ class MytekSite(BaseSite):
 
         os.makedirs("config", exist_ok=True)
 
-        with open("config/mytekcategories.py", "w", encoding="utf-8") as f:
+        with open("config/categoriesMytek.py", "w", encoding="utf-8") as f:
             f.write("CATEGORIES = {\n")
             for k, v in categories.items():
                 f.write(f'    "{k}": "{v}",\n')
@@ -125,7 +134,8 @@ class MytekSite(BaseSite):
     # DUPLICATE HANDLER
     # =====================================================
     
-    def handle_duplicate(self, product_id, source, seen_products):
+    def handle_duplicate(self, product_id: str, source: str, seen_products: Dict) -> bool:
+        """Check if product was already seen in this session."""
         with self.lock:
             if product_id in seen_products:
                 dup_logger.warning(
@@ -140,7 +150,8 @@ class MytekSite(BaseSite):
     # SEARCH
     # =====================================================
     
-    def search(self, query):
+    def search(self, query: str) -> Dict:
+        """Search for products by query."""
         logger.info(f"{self.name} | SEARCH_START | {query}")
 
         page = 1
@@ -194,7 +205,8 @@ class MytekSite(BaseSite):
     # PRODUCT PARSER
     # =====================================================
     
-    def parse_product(self, url, source, product_id=None):
+    def parse_product(self, url: str, source: str, product_id: Optional[str] = None) -> Optional[Dict]:
+        """Parse a product page."""
         html = get(url)
 
         if not html:
@@ -203,19 +215,18 @@ class MytekSite(BaseSite):
         return parse_mytek_product_page(html, url, self.name, source, product_id)
 
     # =====================================================
-    # PRODUCT WORKER - Redis/PostgreSQL only (no file skip)
+    # PRODUCT WORKER
     # =====================================================
     
-    def scrape_product_worker(self, product, seen_products, source):
+    def scrape_product_worker(self, product: Dict, seen_products: Dict, source: str) -> Optional[Dict]:
+        """Process a single product - check if exists, parse, save."""
         pid = product.get("main_product_id")
         url = product.get("product_link")
 
         if not pid or not url:
             return None
 
-        # =====================================================
-        # CHECK 1: Duplicate in current session
-        # =====================================================
+        # ─── Check 1: Duplicate in current session ────────────
         if self.handle_duplicate(pid, source, seen_products):
             with self.lock:
                 self.stats["skipped_duplicates"] += 1
@@ -223,39 +234,35 @@ class MytekSite(BaseSite):
                     self._update_stats(self.stats)
             return None
 
-        # =====================================================
-        # CHECK 2: Product already exists in Redis/PostgreSQL
-        # =====================================================
+        # ─── Check 2: Product already exists ──────────────────
         if self._product_exists(pid):
             with self.lock:
                 self.stats["skipped_duplicates"] += 1
                 if hasattr(self, '_update_stats'):
                     self._update_stats(self.stats)
-            logger.debug(f"{self.name} | SKIP_EXISTING_DB | {pid}")
+            logger.debug(f"{self.name} | SKIP_EXISTING | {pid}")
             return None
 
         try:
             result = self.parse_product(url, source, pid)
 
             if result:
-                # =====================================================
-                # SAVE: Use parent's _save_new_product for Redis + Batching
-                # =====================================================
+                # Save using parent's _save_new_product (Redis + Batching)
                 if super()._save_new_product(result, pid):
                     self.performance.add_product()
                     self.total_products += 1
                     
-                    # Update stats for dashboard
+                    # Update stats
                     self.stats["new_products"] = self.total_products
                     self.stats["total_products_found"] = self.total_products
                     
                     if hasattr(self, '_update_stats'):
                         self._update_stats(self.stats)
                     
-                    # Also write to results file for backup
+                    # Write to results file for backup
                     write_product_result(result, self.name)
                     
-                    logger.info(f"{self.name} | PRODUCT_SAVED | {pid}")
+                    logger.debug(f"{self.name} | SAVED | {pid}")
                     return result
                 else:
                     logger.warning(f"{self.name} | SAVE_FAILED | {pid}")
@@ -278,31 +285,46 @@ class MytekSite(BaseSite):
             return None
 
     # =====================================================
-    # CATEGORY SCRAPER
+    # CATEGORY SCRAPER - FIXED
     # =====================================================
 
-    def scrape_category(self, category_name, category_url, seen_products):
+    def scrape_category(self, category_name: str, category_url: str, seen_products: Dict) -> List[Dict]:
+        """
+        Scrape a single category.
+        Returns list of products found.
+        """
         logger.info(f"{self.name} | CATEGORY_START | {category_name}")
         
+        # Update progress
         self.stats['current_category'] = category_name
+        self.stats['current_page'] = 0
+        
+        if hasattr(self, '_update_stats'):
+            self._update_stats(self.stats)
         
         results = []
         seen_ids = set()
         
-        first_html = get(category_url)
+        # ─── Get first page to determine total pages ──────────
+        first_html = self.requester.get_html(category_url)
         if not first_html:
             self._add_error(f"No first page: {category_name}")
             return results
         
-        total_pages = self.get_category_page_count(first_html)
+        total_pages = self._get_category_page_count(first_html)
         
+        # Update stats
         self.stats['total_pages'] = total_pages
         self.stats['current_page'] = 0
         
         if hasattr(self, '_update_stats'):
             self._update_stats(self.stats)
         
+        logger.info(f"{self.name} | CATEGORY_PAGES | {category_name} | total_pages={total_pages}")
+        
+        # ─── Process each page ──────────────────────────────────
         for page in range(1, total_pages + 1):
+            # Build page URL
             if '?' in category_url:
                 url = f"{category_url}&p={page}"
             else:
@@ -310,6 +332,7 @@ class MytekSite(BaseSite):
             
             html = self.requester.get_html(url)
             
+            # Update progress
             self.stats['current_page'] = page
             self.stats['current_product'] = f"Page {page}/{total_pages}"
             
@@ -320,6 +343,7 @@ class MytekSite(BaseSite):
                 self._add_error(f"Page {page} empty: {category_name}")
                 continue
             
+            # ─── Parse products from page ──────────────────────
             try:
                 products = parse_mytek_products(html, self.name)
             except Exception as e:
@@ -330,21 +354,16 @@ class MytekSite(BaseSite):
             if not products:
                 continue
             
+            # ─── Check for loop detection ──────────────────────
             first_id = products[0].get("main_product_id")
             if first_id in seen_ids:
+                logger.warning(f"{self.name} | LOOP_DETECTED | {category_name} | page={page}")
                 break
             
             for p in products:
                 seen_ids.add(p.get("main_product_id"))
             
-            # =====================================================
-            # REMOVED: File-based existing_ids filter
-            # All deduplication is now handled by Redis/PostgreSQL
-            # =====================================================
-            
-            if not products:
-                continue
-            
+            # ─── Process products with thread pool ─────────────
             with ThreadPoolExecutor(max_workers=20) as executor:
                 futures = [
                     executor.submit(
@@ -370,22 +389,20 @@ class MytekSite(BaseSite):
                                 self._update_stats(self.stats)
                         self._add_error(f"Future error: {str(e)[:50]}")
             
-            # Update batch status after each page
+            # Log batch status
             batch_size = self.get_pending_batch_size()
             if batch_size > 0:
-                logger.info(f"{self.name} | PAGE_BATCH | {category_name} | page={page} | batch={batch_size}")
-            
-            self.stats['completed_categories'] = page
-            if hasattr(self, '_update_stats'):
-                self._update_stats(self.stats)
+                logger.debug(f"{self.name} | BATCH | {category_name} | page={page} | batch={batch_size}")
         
+        logger.info(f"{self.name} | CATEGORY_DONE | {category_name} | products={len(results)}")
         return results
 
     # =====================================================
     # BRAND SCRAPER
     # =====================================================
     
-    def scrape_brands(self, seen_products):
+    def scrape_brands(self, seen_products: Dict) -> List[Dict]:
+        """Scrape products by brand using search fallback."""
         logger.info(f"{self.name} | BRAND_START")
         results = []
 
@@ -398,11 +415,6 @@ class MytekSite(BaseSite):
                 if not products:
                     logger.info(f"{self.name} | BRAND_EMPTY | {brand}")
                     continue
-
-                # =====================================================
-                # REMOVED: File-based existing_ids filter
-                # All deduplication is now handled by Redis/PostgreSQL
-                # =====================================================
 
                 tasks = [
                     (self.scrape_product_worker, p, seen_products, brand)
@@ -427,12 +439,55 @@ class MytekSite(BaseSite):
         return results
 
     # =====================================================
-    # FULL SCRAPER
+    # PAGINATION DETECTION
+    # =====================================================
+    
+    def _get_category_page_count(self, html: str) -> int:
+        """Extract total number of pages from category HTML."""
+        soup = BeautifulSoup(html, "lxml")
+        
+        # Try common pagination selectors
+        pagination_selectors = [
+            ".pagination li a",
+            ".page-list li a",
+            ".pages li a",
+            "ul.pagination li a",
+            "div.pagination li a"
+        ]
+        
+        nums = []
+        
+        for selector in pagination_selectors:
+            pages = soup.select(selector)
+            for p in pages:
+                try:
+                    text = p.text.strip()
+                    if text.isdigit():
+                        nums.append(int(text))
+                except:
+                    continue
+            if nums:
+                break
+        
+        # If no numbers found, try to find "Page X of Y" pattern
+        if not nums:
+            text = soup.get_text()
+            import re
+            matches = re.findall(r'Page\s+\d+\s+of\s+(\d+)', text, re.IGNORECASE)
+            if matches:
+                return int(matches[0])
+        
+        return max(nums) if nums else 1
+
+    # =====================================================
+    # FULL SCRAPER - FIXED
     # =====================================================
 
-    # sites/mytek.py - Updated scrape_site
-
     def scrape_site(self):
+        """
+        Main scraping entry point.
+        Scrapes ALL categories from CATEGORIES dict.
+        """
         logger.info(f"{self.name} | SCRAPE_START")
         log_global(f"{self.name} | SCRAPE_START")
 
@@ -442,20 +497,16 @@ class MytekSite(BaseSite):
         
         total_categories = len(CATEGORIES)
 
-        # =====================================================
-        # RESET DASHBOARD STATS FOR NEW SCRAPE CYCLE
-        # =====================================================
+        # ─── Reset dashboard stats ────────────────────────────
         try:
             from scraping.engine.multi_scrape_progress import get_multi_scrape_progress
             progress = get_multi_scrape_progress()
             progress.reset_site(self.name)
-            logger.info(f"{self.name} | DASHBOARD_RESET | new cycle")
+            logger.info(f"{self.name} | DASHBOARD_RESET")
         except Exception as e:
             logger.debug(f"{self.name} | DASHBOARD_RESET_ERROR | {e}")
         
-        # =====================================================
-        # FIX: Initialize connections BEFORE scraping
-        # =====================================================
+        # ─── Initialize connections ────────────────────────────
         try:
             if not self._init_connections():
                 logger.error(f"{self.name} | CONNECTION_FAILED")
@@ -474,6 +525,7 @@ class MytekSite(BaseSite):
                 "stats": self.stats
             }
         
+        # ─── Reset stats ──────────────────────────────────────
         self.stats = {
             "new_products": 0,
             "skipped_duplicates": 0,
@@ -490,43 +542,68 @@ class MytekSite(BaseSite):
             "category_progress": 0
         }
         
+        self.completed_categories_count = 0
+        self.total_products = 0
+        
         logger.info(f"{self.name} | STARTING | total_categories={total_categories}")
         
         if hasattr(self, '_update_stats'):
             self._update_stats(self.stats)
 
         try:
+            # ─── Iterate through ALL categories ────────────────
             for i, (name, url) in enumerate(CATEGORIES.items(), start=1):
+                self.current_category_index = i
                 self.stats['current_category'] = name
+                self.stats['category_progress'] = ((i - 1) / total_categories) * 100
+                
                 if hasattr(self, '_update_stats'):
                     self._update_stats(self.stats)
                 
+                logger.info(f"{self.name} | CATEGORY_PROGRESS | {i}/{total_categories} | {name}")
+                
                 try:
+                    # Scrape this category
                     res = self.scrape_category(name, url, seen_products)
                     results.extend(res)
+                    
+                    # Update completed count
+                    self.completed_categories_count = i
+                    self.stats['completed_categories'] = i
+                    self.stats['category_progress'] = (i / total_categories) * 100
+                    
+                    if hasattr(self, '_update_stats'):
+                        self._update_stats(self.stats)
+                    
+                    # Log progress
+                    batch_size = self.get_pending_batch_size()
+                    logger.info(
+                        f"{self.name} | PROGRESS | "
+                        f"{i}/{total_categories} categories | "
+                        f"products={len(results)} | "
+                        f"skipped={self.stats['skipped_duplicates']} | "
+                        f"batch={batch_size}"
+                    )
+                    
                 except Exception as e:
                     error_msg = f"Category '{name}' failed: {str(e)[:50]}"
                     logger.error(f"{self.name} | CATEGORY_ERROR | {name} | {e}")
                     self._add_error(error_msg)
+                    # Continue to next category - don't stop!
                     continue
-                
-                self.stats['completed_categories'] = i
-                self.stats['category_progress'] = (i / total_categories) * 100
-                
-                if hasattr(self, '_update_stats'):
-                    self._update_stats(self.stats)
-                
-                batch_size = self.get_pending_batch_size()
-                logger.info(f"Progress: {i}/{total_categories} categories completed | new_products={len(results)} | batch={batch_size} | skipped={self.stats['skipped_duplicates']}")
 
+            # ─── Brand fallback ──────────────────────────────────
             try:
+                logger.info(f"{self.name} | BRAND_FALLBACK_START")
                 brand_results = self.scrape_brands(seen_products)
                 results.extend(brand_results)
+                logger.info(f"{self.name} | BRAND_FALLBACK_DONE | {len(brand_results)} products")
             except Exception as e:
                 error_msg = f"Brands fallback failed: {str(e)[:50]}"
                 logger.error(f"{self.name} | BRANDS_ERROR | {e}")
                 self._add_error(error_msg)
 
+            # ─── Mark complete ──────────────────────────────────
             self.stats['completed_categories'] = total_categories
             self.stats['category_progress'] = 100
             
@@ -548,9 +625,7 @@ class MytekSite(BaseSite):
             traceback.print_exc()
             self._add_error(error_msg)
         finally:
-            # =====================================================
-            # FLUSH ANY REMAINING PRODUCTS
-            # =====================================================
+            # ─── Flush remaining products ──────────────────────
             batch_size = self.get_pending_batch_size()
             if batch_size > 0:
                 logger.info(f"{self.name} | FLUSHING_PENDING | {batch_size} products")
@@ -564,20 +639,24 @@ class MytekSite(BaseSite):
             # Log final summary
             self.log_final_summary(results)
             
+            # Close connections
             self._close_connections()
 
         logger.info(f"{self.name} | SCRAPE_DONE | total={len(results)}")
         log_global(f"{self.name} | SCRAPE_DONE | total={len(results)}")
 
-        print("\n==============================")
-        print(f" {self.name} SCRAPING DONE")
-        print(f" TOTAL PRODUCTS: {len(results)}")
-        print(f" NEW PRODUCTS: {self.stats['new_products']}")
-        print(f" SKIPPED (EXISTING): {self.stats['skipped_duplicates']}")
-        print(f" REDIS SAVED: {self.stats['redis_saved']}")
-        print(f" POSTGRES SAVED: {self.stats['postgres_saved']}")
-        print(f" ERRORS: {self.stats['errors']}")
-        print("==============================\n")
+        # ─── Print summary ─────────────────────────────────────
+        print("\n" + "=" * 60)
+        print(f" {self.name} SCRAPING COMPLETE")
+        print("=" * 60)
+        print(f" TOTAL PRODUCTS FOUND:    {len(results)}")
+        print(f" NEW PRODUCTS SAVED:      {self.stats['new_products']}")
+        print(f" SKIPPED (EXISTING):      {self.stats['skipped_duplicates']}")
+        print(f" CATEGORIES COMPLETED:    {self.stats['completed_categories']}/{total_categories}")
+        print(f" ERRORS:                  {self.stats['errors']}")
+        print(f" REDIS SAVES:             {self.stats['redis_saved']}")
+        print(f" POSTGRES SAVES:          {self.stats['postgres_saved']}")
+        print("=" * 60)
 
         return {
             "site": self.name,
@@ -586,40 +665,7 @@ class MytekSite(BaseSite):
             "stats": self.stats
         }
 
-    # =====================================================
-    # PAGINATION DETECTION
-    # =====================================================
-    
-    def get_category_page_count(self, html):
-        soup = BeautifulSoup(html, "lxml")
-        
-        pages = soup.select(".pagination li a")
-        nums = []
-        
-        for p in pages:
-            try:
-                text = p.text.strip()
-                if text.isdigit():
-                    nums.append(int(text))
-            except:
-                continue
-        
-        if nums:
-            return max(nums)
-        
-        pages = soup.select(".page-list li a")
-        nums = []
-        
-        for p in pages:
-            try:
-                text = p.text.strip()
-                if text.isdigit():
-                    nums.append(int(text))
-            except:
-                continue
-        
-        return max(nums) if nums else 1
-
 
 def create_mytek_site() -> MytekSite:
+    """Factory function for site loader."""
     return MytekSite()

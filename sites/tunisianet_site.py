@@ -149,6 +149,7 @@ class TunisiaNetSite(BaseSite):
 
     def parse_product(self, url: str, product_id: str = None) -> Optional[Dict]:
         html = self.requester.get_html(url)
+        logger.warning(f"\n html  : {html}")
         if not html:
             return None
         

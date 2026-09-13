@@ -12,6 +12,9 @@ from datetime import datetime, timedelta
 from typing import Dict, List
 import threading
 import time
+import logging
+
+logger = logging.getLogger("multi_scrape_progress")
 
 console = Console()
 
@@ -24,11 +27,9 @@ class MultiScrapeProgress:
         self.live = None
         self.running = False
         
-        # =====================================================
-        # ERROR COLLECTION - Clean error display
-        # =====================================================
-        self.recent_errors: List[Dict] = []  # Store recent errors
-        self.max_errors_display = 5  # Show max 5 errors at a time
+        # Error collection
+        self.recent_errors: List[Dict] = []
+        self.max_errors_display = 5
         self.error_lock = threading.Lock()
         
     def add_error(self, site: str, message: str, error_type: str = "error"):
@@ -36,11 +37,10 @@ class MultiScrapeProgress:
         with self.error_lock:
             self.recent_errors.append({
                 'site': site,
-                'message': message[:60],  # Truncate long messages
+                'message': message[:60],
                 'type': error_type,
                 'time': datetime.now()
             })
-            # Keep only last 20 errors
             if len(self.recent_errors) > 20:
                 self.recent_errors = self.recent_errors[-20:]
             self._refresh()
@@ -75,6 +75,9 @@ class MultiScrapeProgress:
                 'total_pages': 0,
                 'products_processed': 0,
                 'total_products': 0,
+                'last_cycle_complete': False,
+                'is_running': False,
+                'completed_cycle_count': 0,
             }
             self._refresh()
             return True
@@ -86,38 +89,36 @@ class MultiScrapeProgress:
     
     def reset_site(self, site: str):
         """
-        Reset site stats for a new cycle.
-        This is called when a site goes live again for a new scrape.
+        Reset site stats for a NEW cycle.
+        Resets ALL stats to 0 for the new cycle.
         """
         if site in self.sites:
-            # Preserve the total categories and cycle count
-            old_total = self.sites[site].get('total', 1)
-            old_cycle = self.sites[site].get('cycle_count', 0)
-            
-            # Reset all stats but keep total and increment cycle
+            # ─── RESET ALL STATS TO 0 ────────────────────────────
             self.sites[site]['new_products'] = 0
-            self.sites[site]['skipped'] = 0
+            self.sites[site]['skipped'] = 0  # ← Reset to 0
             self.sites[site]['errors'] = 0
             self.sites[site]['redis_saved'] = 0
             self.sites[site]['postgres_saved'] = 0
             self.sites[site]['completed'] = 0
             self.sites[site]['status'] = '🔄 Starting...'
-            self.sites[site]['current_item'] = ''
+            self.sites[site]['current_item'] = 'Starting...'
             self.sites[site]['started_at'] = datetime.now()
             self.sites[site]['last_update'] = datetime.now()
             self.sites[site]['is_complete'] = False
-            self.sites[site]['cycle_count'] = old_cycle + 1
             self.sites[site]['page'] = 0
             self.sites[site]['total_pages'] = 0
             self.sites[site]['products_processed'] = 0
             self.sites[site]['total_products'] = 0
             self.sites[site]['eta'] = '--'
+            self.sites[site]['next_scrape'] = None
+            self.sites[site]['is_running'] = True
+            self.sites[site]['cycle_completed_at'] = None
             
             # Clear errors for this site
             with self.error_lock:
                 self.recent_errors = [e for e in self.recent_errors if e.get('site') != site]
             
-            logger.info(f"RESET_SITE | {site} | cycle={self.sites[site]['cycle_count']}")
+            logger.info(f"RESET_SITE | {site} | cycle={self.sites[site]['cycle_count'] + 1}")
             self._refresh()
     
     def update(self, site: str, **kwargs):
@@ -131,7 +132,6 @@ class MultiScrapeProgress:
     
     def update_stats(self, site: str, **kwargs):
         if site in self.sites:
-            # Map stats keys to dashboard keys
             stat_mapping = {
                 'new_products': 'new_products',
                 'skipped_duplicates': 'skipped',
@@ -161,16 +161,35 @@ class MultiScrapeProgress:
     def set_status(self, site: str, status: str):
         if site in self.sites:
             self.sites[site]['status'] = status
+            self.sites[site]['last_update'] = datetime.now()
+            
             if 'Complete' in status or 'Done' in status:
                 self.sites[site]['is_complete'] = True
+                self.sites[site]['is_running'] = False
                 self.sites[site]['eta'] = '✅ Done'
+                self.sites[site]['cycle_completed_at'] = datetime.now()
+                self.sites[site]['last_cycle_status'] = status
+                self.sites[site]['cycle_count'] += 1
+                self.sites[site]['completed_cycle_count'] = self.sites[site].get('completed_cycle_count', 0) + 1
+                logger.info(f"CYCLE_COMPLETE | {site} | cycle={self.sites[site]['cycle_count']}")
+            elif 'Starting' in status or 'Cycle' in status:
+                self.sites[site]['is_complete'] = False
+                self.sites[site]['is_running'] = True
+                self.sites[site]['eta'] = '--'
+            elif 'Error' in status:
+                self.sites[site]['is_complete'] = True
+                self.sites[site]['is_running'] = False
             else:
                 self.sites[site]['is_complete'] = False
+                self.sites[site]['is_running'] = True
+            
+            logger.debug(f"SET_STATUS | {site} | status={status}")
             self._refresh()
     
     def set_current_item(self, site: str, item: str):
         if site in self.sites:
             self.sites[site]['current_item'] = item[:40] if item else ''
+            self.sites[site]['last_update'] = datetime.now()
             self._refresh()
     
     def set_current_category(self, site: str, category: str):
@@ -189,19 +208,13 @@ class MultiScrapeProgress:
     def increment_new_product(self, site: str):
         if site in self.sites:
             self.sites[site]['new_products'] += 1
-            self.sites[site]['status'] = "✅ +1 NEW"
+            self.sites[site]['last_update'] = datetime.now()
             self._refresh()
-            def reset():
-                time.sleep(1.5)
-                if site in self.sites and self.sites[site]['status'] == "✅ +1 NEW":
-                    self.sites[site]['status'] = "🔄 Running"
-                    self._refresh()
-            threading.Thread(target=reset, daemon=True).start()
     
     def increment_error(self, site: str, error_msg: str = ""):
-        """Increment error counter and add to recent errors"""
         if site in self.sites:
             self.sites[site]['errors'] += 1
+            self.sites[site]['last_update'] = datetime.now()
             if error_msg:
                 self.add_error(site, error_msg)
             self._refresh()
@@ -215,8 +228,12 @@ class MultiScrapeProgress:
         total = data.get('total', 1)
         completed = data.get('completed', 0)
         started_at = data.get('started_at', datetime.now())
+        is_complete = data.get('is_complete', False)
+        is_running = data.get('is_running', False)
         
-        if completed > 0 and total > 0 and completed < total:
+        if is_complete or completed >= total:
+            data['eta'] = "✅ Done"
+        elif is_running and completed > 0 and total > 0:
             elapsed = (datetime.now() - started_at).total_seconds()
             if elapsed > 0:
                 rate = completed / elapsed
@@ -232,8 +249,6 @@ class MultiScrapeProgress:
                     data['eta'] = f"{hours}h {minutes}m"
             else:
                 data['eta'] = "--"
-        elif completed >= total and total > 0:
-            data['eta'] = "✅ Done"
         else:
             data['eta'] = "--"
     
@@ -274,59 +289,73 @@ class MultiScrapeProgress:
         table.add_column("Site", style="bold white", width=12, no_wrap=True)
         table.add_column("Progress", width=38)
         table.add_column("Stats", style="white", width=28)
-        table.add_column("Status", style="yellow", width=16)
+        table.add_column("Status", style="yellow", width=18)
         table.add_column("ETA", style="dim", width=14)
         table.add_column("⏱️ Next", style="dim", width=14)
         
-        table.add_row("─" * 12, "─" * 38, "─" * 28, "─" * 16, "─" * 14, "─" * 14, style="dim")
+        table.add_row("─" * 12, "─" * 38, "─" * 28, "─" * 18, "─" * 14, "─" * 14, style="dim")
         
         site_count = len(self.sites)
         for idx, (site, data) in enumerate(self.sites.items()):
             total = data.get('total', 1)
             completed = data.get('completed', 0)
+            
+            # Current cycle stats only
             new_products = data.get('new_products', 0)
-            skipped = data.get('skipped', 0)
+            skipped = data.get('skipped', 0)  # ← Only current cycle skipped
             errors = data.get('errors', 0)
             redis_saved = data.get('redis_saved', 0)
             postgres_saved = data.get('postgres_saved', 0)
+            
             status = data.get('status', '')
             current_item = data.get('current_item', '')
             page = data.get('page', 0)
             total_pages = data.get('total_pages', 0)
             total_products = data.get('total_products', 0)
             products_processed = data.get('products_processed', 0)
-            started_at = data.get('started_at', datetime.now())
-            last_update = data.get('last_update', datetime.now())
-            next_scrape = data.get('next_scrape')
             is_complete = data.get('is_complete', False)
             cycle_count = data.get('cycle_count', 0)
+            completed_cycle_count = data.get('completed_cycle_count', 0)
             eta = data.get('eta', '--')
+            next_scrape = data.get('next_scrape')
+            last_update = data.get('last_update', datetime.now())
+            is_running = data.get('is_running', False)
             
-            # Ensure completed never exceeds total
             if completed > total and total > 0:
                 completed = total
                 self.sites[site]['completed'] = total
             
-            # Calculate percentage
             if total > 0:
                 percent = min((completed / total) * 100, 100.0)
             else:
                 percent = 0
             
-            # Check if site is stale
-            is_stale = (datetime.now() - last_update).seconds > 60
-            if is_stale and 'Complete' not in status and 'Error' not in status and '+1' not in status and 'Done' not in status:
-                status_display = "⏳ Waiting..."
-            elif 'Complete' in status or 'Done' in status:
-                status_display = "✅ Done"
+            # ─── DETERMINE STATUS DISPLAY ──────────────────────
+            display_cycle = completed_cycle_count if completed_cycle_count > 0 else cycle_count
+            
+            if is_complete or 'Done' in status or 'Complete' in status:
+                if display_cycle > 0:
+                    status_display = f"✅ Cycle {display_cycle} Done"
+                else:
+                    status_display = "✅ Done"
+                status_color = "green"
+            elif is_running or 'Cycle' in status or 'Running' in status:
+                if display_cycle >= 0:
+                    status_display = f"🔄 Cycle {display_cycle + 1}"
+                else:
+                    status_display = "🔄 Starting..."
+                status_color = "cyan"
             elif 'Error' in status:
                 status_display = "❌ Error"
-            elif '+1' in status:
-                status_display = "🟡 +1 New"
+                status_color = "red"
+            elif (datetime.now() - last_update).seconds > 60:
+                status_display = "⏳ Waiting..."
+                status_color = "yellow"
             else:
-                status_display = f"🔄 Cycle {cycle_count + 1}"
+                status_display = "🔄 Running"
+                status_color = "cyan"
             
-            # Progress bar
+            # ─── PROGRESS BAR ──────────────────────────────────
             if total > 0:
                 bar_len = 20
                 filled = int(bar_len * completed / total) if total > 0 else 0
@@ -337,7 +366,7 @@ class MultiScrapeProgress:
             else:
                 progress_text = "[dim]No categories[/dim]"
             
-            # Show current item (category or page)
+            # ─── CURRENT ITEM ──────────────────────────────────
             if current_item and current_item != 'Starting...':
                 category_display = current_item
                 if page > 0 and total_pages > 0:
@@ -346,21 +375,23 @@ class MultiScrapeProgress:
                     category_display = category_display[:27] + "..."
                 progress_text += f"\n   [dim]📁 {category_display}[/dim]"
             
-            # Show category progress
+            # ─── CATEGORY PROGRESS ─────────────────────────────
             if total > 0:
                 progress_text += f"\n   [dim]📊 {completed}/{total} categories[/dim]"
             
-            # Show product progress if available
+            # ─── PRODUCT PROGRESS ──────────────────────────────
             if total_products > 0:
                 progress_text += f"\n   [dim]📦 {products_processed}/{total_products} products[/dim]"
             
-            # Stats display
+            # ─── STATS DISPLAY ──────────────────────────────────
+            # Only show current cycle stats
             stats_parts = []
             if new_products > 0:
                 stats_parts.append(f"[bold green]✓ {new_products}[/bold green]")
             else:
                 stats_parts.append(f"✓ {new_products}")
             
+            # Show skipped only if > 0 for current cycle
             if skipped > 0:
                 stats_parts.append(f"[yellow]○ {skipped}[/yellow]")
             else:
@@ -371,27 +402,18 @@ class MultiScrapeProgress:
             else:
                 stats_parts.append(f"✗ {errors}")
             
-            stats = "  ".join(stats_parts)
+            stats_text = "  ".join(stats_parts)
             
-            # Add saved info if any
+            # ─── SAVED INFO ──────────────────────────────────────
+            saved_parts = []
             if postgres_saved > 0:
-                stats += f"\n   [dim]💾 Saved: {postgres_saved} (PG)[/dim]"
-            elif redis_saved > 0:
-                stats += f"\n   [dim]💾 Saved: {redis_saved} (Redis)[/dim]"
+                saved_parts.append(f"💾 {postgres_saved} PG")
+            if redis_saved > 0:
+                saved_parts.append(f"💾 {redis_saved} Redis")
+            if saved_parts:
+                stats_text += f"\n   [dim]{' | '.join(saved_parts)}[/dim]"
             
-            # Status color
-            if 'Done' in status_display:
-                status_color = "green"
-            elif 'Error' in status_display:
-                status_color = "red"
-            elif 'Waiting' in status_display:
-                status_color = "yellow"
-            elif '+1' in status_display:
-                status_color = "yellow"
-            else:
-                status_color = "cyan"
-            
-            # ETA display
+            # ─── ETA ──────────────────────────────────────────
             if eta == "✅ Done":
                 eta_display = "[green]✅ Done[/green]"
             elif eta == "--":
@@ -399,7 +421,7 @@ class MultiScrapeProgress:
             else:
                 eta_display = f"[dim]{eta}[/dim]"
             
-            # Next column
+            # ─── NEXT COLUMN ──────────────────────────────────
             next_display = "--"
             if is_complete and next_scrape:
                 remaining = (next_scrape - datetime.now()).total_seconds()
@@ -407,42 +429,55 @@ class MultiScrapeProgress:
                     next_display = self._format_countdown(remaining)
                 elif remaining <= 0:
                     next_display = "🔴 NOW"
-                else:
-                    next_display = "--"
-            elif 'Done' in status_display:
+            elif is_complete:
                 next_display = "✅ Done"
-            elif 'Error' in status_display:
-                next_display = "--"
+            
+            # ─── SITE NAME WITH CYCLE NUMBER ────────────────────
+            if display_cycle > 0:
+                site_display = f"[bold]{site.upper()}[/bold] [dim]#{display_cycle}[/dim]"
+            else:
+                site_display = f"[bold]{site.upper()}[/bold]"
             
             table.add_row(
-                f"[bold]{site.upper()}[/bold]",
+                site_display,
                 progress_text,
-                stats,
+                stats_text,
                 f"[{status_color}]{status_display}[/{status_color}]",
                 eta_display,
                 next_display
             )
             
             if idx < site_count - 1:
-                table.add_row("─" * 12, "─" * 38, "─" * 28, "─" * 16, "─" * 14, "─" * 14, style="dim")
+                table.add_row("─" * 12, "─" * 38, "─" * 28, "─" * 18, "─" * 14, "─" * 14, style="dim")
         
-        # Footer with error section
+        # ─── FOOTER ─────────────────────────────────────────────
         total_new = sum(d.get('new_products', 0) for d in self.sites.values())
+        total_skipped = sum(d.get('skipped', 0) for d in self.sites.values())  # ← Current cycle only
         total_errors = sum(d.get('errors', 0) for d in self.sites.values())
         total_completed = sum(d.get('completed', 0) for d in self.sites.values())
         total_all = sum(d.get('total', 0) for d in self.sites.values())
-        total_skipped = sum(d.get('skipped', 0) for d in self.sites.values())
+        total_redis = sum(d.get('redis_saved', 0) for d in self.sites.values())
+        total_postgres = sum(d.get('postgres_saved', 0) for d in self.sites.values())
         
         overall_percent = (total_completed / total_all * 100) if total_all > 0 else 0
         
-        # Build footer parts
         footer_parts = [
             f"📊 {total_completed}/{total_all} categories ({overall_percent:.1f}%)",
             f"📦 {total_new} new",
-            f"⏭️ {total_skipped} skipped",
         ]
         
-        # Add errors with count
+        # Only show skipped in footer if > 0
+        if total_skipped > 0:
+            footer_parts.append(f"⏭️ {total_skipped} skipped")
+        
+        saved_parts = []
+        if total_postgres > 0:
+            saved_parts.append(f"💾 {total_postgres} PG")
+        if total_redis > 0:
+            saved_parts.append(f"💾 {total_redis} Redis")
+        if saved_parts:
+            footer_parts.append(f"{' | '.join(saved_parts)}")
+        
         if total_errors > 0:
             footer_parts.append(f"[red]❌ {total_errors} errors[/red]")
         else:
@@ -450,30 +485,21 @@ class MultiScrapeProgress:
         
         footer_text = "  |  ".join(footer_parts)
         
-        # =====================================================
-        # ERROR SECTION - Shows recent errors at the bottom
-        # =====================================================
         error_section = ""
         with self.error_lock:
             if self.recent_errors:
-                # Show only the most recent errors
                 recent = self.recent_errors[-self.max_errors_display:]
                 error_lines = []
                 for err in recent:
-                    # Format: "SITE: error message"
                     site_name = err['site'].upper() if err['site'] else 'UNKNOWN'
                     msg = err['message']
                     if len(msg) > 50:
                         msg = msg[:47] + "..."
-                    # Highlight the site name in red
                     error_lines.append(f"[red]⚠[/red] [red]{site_name}:[/red] [dim]{msg}[/dim]")
                 
                 error_section = "\n".join(error_lines)
-                
-                # Show error count header
                 error_header = f"[bold red]⚠ {len(self.recent_errors)} errors | Most recent:[/bold red]"
                 
-                # Build error panel
                 if error_section:
                     footer = Panel(
                         f"{footer_text}\n\n{error_header}\n{error_section}",

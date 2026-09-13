@@ -253,35 +253,58 @@ class BaseSite:
             return False
     
     def _init_db(self) -> bool:
-        """Initialize PostgreSQL connection."""
+        """
+        Initialize PostgreSQL connection using connection pool.
+        The Database class handles connection pooling internally.
+        
+        Returns:
+            bool: True if database connection is available, False otherwise.
+        """
         try:
             logger.info(f"{self.name} | INIT_DB | Starting...")
             self.db = Database()
             
-            if self.db and hasattr(self.db, 'conn') and self.db.conn:
-                logger.info(f"{self.name} | DB_READY")
+            # =====================================================
+            # TEST THE CONNECTION BY EXECUTING A SIMPLE QUERY
+            # =====================================================
+            try:
+                # Use the connection pool to get a connection and test it
+                with self.db.get_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT 1")
+                    cursor.close()
+                    
+                logger.info(f"{self.name} | DB_READY | connection pool active")
                 return True
-            else:
-                logger.error(f"{self.name} | DB_CONNECTION_FAILED")
+                
+            except Exception as e:
+                logger.error(f"{self.name} | DB_CONNECTION_TEST_FAILED | {e}")
                 self.db = None
                 return False
                 
         except Exception as e:
             logger.error(f"{self.name} | DB_ERROR | {e}")
+            import traceback
+            traceback.print_exc()
             self.db = None
             return False
     
     def _close_connections(self):
-        """Close database connections."""
+        """
+        Close/release database connections back to the pool.
+        The connection pool stays open for other sites to use.
+        """
         logger.info(f"{self.name} | CLOSE_CONNECTIONS | Starting...")
         
         try:
             if self.db:
+                # The Database.close() method releases the connection back to the pool
                 self.db.close()
-                logger.info(f"{self.name} | DB_CLOSED")
+                logger.info(f"{self.name} | DB_CONNECTION_RELEASED")
         except Exception as e:
             logger.error(f"{self.name} | DB_CLOSE_ERROR | {e}")
         
+        # Clear references but keep the pool alive for other sites
         self.cache = None
         self.redis_client = None
         logger.info(f"{self.name} | CONNECTIONS_CLOSED")
@@ -291,6 +314,38 @@ class BaseSite:
         if not self._connections_initialized:
             return self._init_connections()
         return True
+    
+    def _is_db_available(self) -> bool:
+        """
+        Check if PostgreSQL is available by testing the connection pool.
+        
+        Returns:
+            bool: True if database is available, False otherwise.
+        """
+        if not self._ensure_connections():
+            return False
+        
+        if self.db is None:
+            return False
+        
+        # Test the connection
+        try:
+            with self.db.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT 1")
+                cursor.close()
+            return True
+        except Exception as e:
+            logger.debug(f"{self.name} | DB_AVAILABILITY_CHECK_FAILED | {e}")
+            return False
+    
+    def get_connection_status(self) -> Dict[str, bool]:
+        """Get current connection status."""
+        return {
+            'redis': self.cache is not None and self.redis_client is not None,
+            'db': self._is_db_available(),
+            'initialized': self._connections_initialized
+        }
     
     # =====================================================
     # PRODUCT EXISTENCE CHECK
