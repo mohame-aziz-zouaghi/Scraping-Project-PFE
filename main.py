@@ -4,6 +4,10 @@ Main entry point for Scraping & Monitoring System
 """
 import sys
 import os
+from core.logger import setup_logger, suppress_http_logging
+
+setup_logger("global", "scraper")
+suppress_http_logging()
 
 # Add project root to path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))

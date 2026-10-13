@@ -1,229 +1,220 @@
 # core/utils/price_cleaner.py
 """
-Universal price cleaner - Shared across all sites
-Handles multiple formats, currencies, and automatic rounding
+Universal price cleaner.
+
+Normalizes any price string to a plain float in the site's base
+currency unit (dinar for Tunisian sites, dollar for USD, ...).
+
+Never returns a value that has been inflated by a thousand-separator
+misread. The rule is simple:
+
+  - Space-like characters (regular, thin, narrow no-break, no-break)
+    are always thousand separators.
+  - "." and "," are candidates for the decimal separator. We pick
+    the right one based on position and digit count.
+
+Examples (Tunisian sites, base unit = dinar):
+    "2 715,000 DT"       -> 2715.00
+    "499,000 DT"         -> 499.00
+    "1,369,000 DT"       -> 1369.00
+    "3 219,00 TND"       -> 3219.00
+    "2\\u202f989,000 DT" -> 2989.00
+    "1,234.50 USD"       -> 1234.50
+    "€ 1.234,50"         -> 1234.50
+    "1958.999799"        -> 1959.00
 """
+from __future__ import annotations
+
 import re
-from typing import Any, Optional, Union
 from decimal import Decimal, ROUND_HALF_UP
+from typing import Any, Optional, Union
 
 
-# =====================================================
-# CONSTANTS
-# =====================================================
+# ═══════════════════════════════════════════════════════════
+# Constants
+# ═══════════════════════════════════════════════════════════
+_CURRENCY_SYMBOLS = (
+    "TND", "DT", "د.ت",
+    "$", "USD",
+    "€", "EUR",
+    "£", "GBP",
+    "¥", "JPY",
+    "₹", "INR",
+    "₪", "ILS",
+    "₩", "KRW",
+    "₦", "NGN",
+    "₽", "RUB",
+    "₺", "TRY",
+    "₴", "UAH",
+    "R$", "BRL",
+    "MX$", "MXN",
+    "C$", "CAD",
+    "A$", "AUD",
+    "CHF", "SEK", "NOK", "DKK", "PLN", "HUF", "CZK",
+)
 
-# Supported currency symbols
-CURRENCY_SYMBOLS = [
-    "TND", "DT", "د.ت",  # Tunisian Dinar
-    "$", "USD",           # US Dollar
-    "€", "EUR",           # Euro
-    "£", "GBP",           # British Pound
-    "¥", "JPY",           # Japanese Yen
-    "₹", "INR",           # Indian Rupee
-    "₪", "ILS",           # Israeli Shekel
-    "₩", "KRW",           # South Korean Won
-    "₦", "NGN",           # Nigerian Naira
-    "₽", "RUB",           # Russian Ruble
-    "₺", "TRY",           # Turkish Lira
-    "₴", "UAH",           # Ukrainian Hryvnia
-    "R$", "BRL",          # Brazilian Real
-    "MX$", "MXN",         # Mexican Peso
-    "C$", "CAD",          # Canadian Dollar
-    "A$", "AUD",          # Australian Dollar
-    "CHF",                # Swiss Franc
-    "SEK",                # Swedish Krona
-    "NOK",                # Norwegian Krone
-    "DKK",                # Danish Krone
-    "PLN",                # Polish Zloty
-    "HUF",                # Hungarian Forint
-    "CZK",                # Czech Koruna
-]
+# Only space-like characters count as thousand separators.
+# Never put "." or "," in this list — they may be the decimal.
+_SPACE_SEPARATORS = (" ", "\u202f", "\u2009", "\xa0")
 
-# Supported thousand separators
-THOUSAND_SEPARATORS = [",", ".", " ", "\u202f", "\u2009", "\xa0"]
+_UNIT_WORDS_RE = re.compile(
+    r"\b(TTC|HT|tax included|excl\.|incl\.|VAT|inc\.\s*VAT)\b",
+    re.IGNORECASE,
+)
 
 
-# =====================================================
-# CORE PRICE CLEANING FUNCTION (SHARED)
-# =====================================================
-
+# ═══════════════════════════════════════════════════════════
+# Public API
+# ═══════════════════════════════════════════════════════════
 def clean_price(
-    price_value: Any,
+    value: Any,
     decimals: int = 2,
-    currency: str = None,
-    return_type: str = "float"
+    return_type: str = "float",
 ) -> Optional[Union[float, int, str]]:
     """
-    Universal price cleaner - cleans any price format and rounds.
-    
-    Handles:
-    - Multiple currencies (TND, $, €, £, etc.)
-    - Multiple formats (1,234.50, 1.234,50, 1 234,50)
-    - Thousand separators (comma, dot, space, thin space)
-    - Decimal separators (dot, comma)
-    - Automatic rounding
-    
+    Parse any price string or number into a normalized value.
+
     Args:
-        price_value: Price value (string, int, float, or None)
-        decimals: Number of decimal places (default: 2)
-        currency: Optional currency to remove (e.g., 'TND', '$', '€')
-        return_type: 'float', 'int', or 'str'
-    
+        value: raw price (str, int, float, or None).
+        decimals: how many decimal places to keep (default 2).
+        return_type: "float" (default), "int", or "str".
+
     Returns:
-        Cleaned price or None if invalid
-    
-    Examples:
-        clean_price("2 715,000 DT") → 2715.0
-        clean_price("$1,234.50") → 1234.5
-        clean_price("€ 1.234,50") → 1234.5
-        clean_price("1,234.50 USD") → 1234.5
-        clean_price("1958.999799") → 1959.0
+        The cleaned price, or None if the input is empty, non-numeric,
+        negative, or otherwise unparseable.
     """
-    if price_value is None:
+    if value is None:
         return None
-    
-    # If it's already a number
-    if isinstance(price_value, (int, float)):
-        return _round_and_return(float(price_value), decimals, return_type)
-    
-    # Convert to string
-    price_str = str(price_value).strip()
-    
-    if not price_str:
+
+    # Already numeric.
+    if isinstance(value, (int, float)):
+        return _round_and_format(float(value), decimals, return_type)
+
+    text = str(value).strip()
+    if not text:
         return None
-    
-    # =====================================================
-    # STEP 1: REMOVE CURRENCY SYMBOLS
-    # =====================================================
-    
-    # Remove specified currency if provided
-    if currency:
-        price_str = price_str.replace(currency, "").strip()
-    
-    # Remove any currency symbol
-    for symbol in CURRENCY_SYMBOLS:
-        price_str = price_str.replace(symbol, "").strip()
-    
-    # Remove common price suffixes
-    price_str = re.sub(r'\s*(TTC|HT|tax included|excl\.|incl\.|VAT|inc\. VAT)\s*', '', price_str, flags=re.IGNORECASE)
-    
-    # =====================================================
-    # STEP 2: DETECT FORMAT AND NORMALIZE
-    # =====================================================
-    
-    # Remove spaces (including thin spaces, non-breaking spaces) - they are thousand separators
-    for sep in THOUSAND_SEPARATORS:
-        price_str = price_str.replace(sep, "")
-    
-    # Now handle decimal separator detection
-    has_comma = ',' in price_str
-    has_dot = '.' in price_str
-    
-    if has_comma and has_dot:
-        # Both exist - determine which is decimal
-        last_comma_pos = price_str.rfind(',')
-        last_dot_pos = price_str.rfind('.')
-        
-        if last_comma_pos > last_dot_pos:
-            # Comma is decimal separator
-            price_str = price_str.replace('.', '')
-            price_str = price_str.replace(',', '.')
-        else:
-            # Dot is decimal separator
-            price_str = price_str.replace(',', '')
-    elif has_comma and not has_dot:
-        # Only comma exists
-        parts = price_str.split(',')
-        if len(parts) == 2 and len(parts[1]) <= 2:
-            # Comma is decimal separator
-            price_str = price_str.replace(',', '.')
-        else:
-            # Comma is thousand separator
-            price_str = price_str.replace(',', '')
-    
-    # Remove any non-numeric characters except dot
-    price_str = re.sub(r'[^\d.]', '', price_str)
-    
-    if not price_str:
+
+    # ── Strip currency labels and unit words.
+    for sym in _CURRENCY_SYMBOLS:
+        text = text.replace(sym, " ")
+    text = _UNIT_WORDS_RE.sub(" ", text).strip()
+    if not text:
         return None
-    
-    # =====================================================
-    # STEP 3: HANDLE MULTIPLE DOTS
-    # =====================================================
-    
-    if price_str.count('.') > 1:
-        parts = price_str.split('.')
-        integer_part = ''.join(parts[:-1])
-        decimal_part = parts[-1]
-        price_str = f"{integer_part}.{decimal_part}"
-    
-    # =====================================================
-    # STEP 4: PARSE AND ROUND
-    # =====================================================
-    
+
+    # ── Collapse space-like thousand separators.
+    for sp in _SPACE_SEPARATORS:
+        text = text.replace(sp, "")
+    if not text:
+        return None
+
+    # ── Resolve the decimal separator.
+    text = _resolve_decimal(text)
+    if text is None:
+        return None
+
+    # ── Strip any residual non-numeric characters.
+    text = re.sub(r"[^\d.]", "", text)
+    if not text or text == ".":
+        return None
+
+    # Collapse multiple dots if any slipped through.
+    if text.count(".") > 1:
+        head, _, tail = text.rpartition(".")
+        text = head.replace(".", "") + "." + tail
+
     try:
-        value = float(price_str)
-        
-        if value < 0:
-            return None
-        
-        return _round_and_return(value, decimals, return_type)
-        
+        num = float(text)
     except ValueError:
         return None
 
+    if num < 0:
+        return None
 
-def _round_and_return(value: float, decimals: int, return_type: str) -> Union[float, int, str]:
-    """Round the value and return in the specified format"""
-    if decimals == 0:
-        rounded = int(round(value))
+    return _round_and_format(num, decimals, return_type)
+
+
+# ═══════════════════════════════════════════════════════════
+# Internals
+# ═══════════════════════════════════════════════════════════
+def _resolve_decimal(text: str) -> Optional[str]:
+    """
+    Rewrite `text` so that its decimal separator is a single dot,
+    and every thousand separator is stripped.
+
+    Called after space-like separators have been removed, so the
+    only candidates left are "." and ",".
+    """
+    has_comma = "," in text
+    has_dot = "." in text
+
+    if has_comma and has_dot:
+        # The rightmost one is the decimal separator.
+        if text.rfind(",") > text.rfind("."):
+            # comma is decimal
+            return text.replace(".", "").replace(",", ".")
+        # dot is decimal
+        return text.replace(",", "")
+
+    if has_comma:
+        return _resolve_single_separator(text, ",")
+
+    if has_dot:
+        return _resolve_single_separator(text, ".")
+
+    return text
+
+
+def _resolve_single_separator(text: str, sep: str) -> Optional[str]:
+    """
+    Decide whether a single-occurring separator is decimal or
+    thousand, based on how many digits follow it.
+    """
+    count = text.count(sep)
+
+    if count > 1:
+        # Multiple occurrences -> thousand separator.
+        return text.replace(sep, "")
+
+    head, _, tail = text.partition(sep)
+
+    # Exactly one separator: look at the tail.
+    if len(tail) in (1, 2):
+        # decimal separator
+        return f"{head}.{tail}"
+    if len(tail) == 3:
+        # thousand separator
+        return f"{head}{tail}"
+
+    # Ambiguous tail length (0, 4, 5, ...): treat as thousand.
+    return f"{head}{tail}"
+
+
+def _round_and_format(
+    value: float, decimals: int, return_type: str
+) -> Union[float, int, str]:
+    if decimals <= 0:
+        rounded: Union[float, int] = int(round(value))
     else:
-        # Use Decimal for proper rounding
-        rounded = float(Decimal(str(value)).quantize(Decimal('0.' + '0' * decimals), rounding=ROUND_HALF_UP))
-    
+        quant = Decimal("0." + "0" * decimals)
+        rounded = float(
+            Decimal(str(value)).quantize(quant, rounding=ROUND_HALF_UP)
+        )
+
     if return_type == "int":
         return int(rounded)
-    elif return_type == "str":
-        if decimals == 0:
+    if return_type == "str":
+        if decimals <= 0:
             return str(int(rounded))
-        else:
-            return f"{rounded:.{decimals}f}"
-    else:  # float
-        return float(rounded)
+        return f"{rounded:.{decimals}f}"
+    return float(rounded)
 
 
-# =====================================================
-# SITE-SPECIFIC CONVENIENCE FUNCTIONS
-# =====================================================
-
-def clean_price_tunisianet(price_str: Any, decimals: int = 2) -> Optional[float]:
-    """Clean Tunisianet price format."""
-    return clean_price(price_str, decimals=decimals, currency="TND")
-
-
-def clean_price_megapc(price_str: Any, decimals: int = 2) -> Optional[float]:
-    """Clean MegaPC price format."""
-    return clean_price(price_str, decimals=decimals)
-
-
-def clean_price_mytek(price_str: Any, decimals: int = 2) -> Optional[float]:
-    """Clean MyTek price format."""
-    return clean_price(price_str, decimals=decimals, currency="TND")
-
-
-def clean_price_generic(price_str: Any, decimals: int = 2) -> Optional[float]:
-    """Generic price cleaner for any format."""
-    return clean_price(price_str, decimals=decimals)
-
-
-# =====================================================
-# PRICE VALIDATION (SHARED)
-# =====================================================
-
-def validate_price(price: Optional[float], min_value: float = 0, max_value: float = 1000000) -> bool:
-    """Validate a price is within reasonable bounds."""
+def validate_price(
+    price: Optional[float],
+    min_value: float = 0,
+    max_value: float = 1_000_000,
+) -> bool:
+    """Return True if `price` is a positive value within range."""
     if price is None:
         return False
-    if price < min_value or price > max_value:
-        return False
-    return True
+    return min_value <= price <= max_value

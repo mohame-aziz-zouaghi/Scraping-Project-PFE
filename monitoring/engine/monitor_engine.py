@@ -41,11 +41,11 @@ class MonitorEngine:
     
     # Optimal worker counts (fallback when config missing)
     OPTIMAL_WORKERS = {
-        "megapc": 40,
-        "tunisianet": 50,
-        "sbs": 30,
-        "mytek": 60,
-        "spacenet": 60,
+        "megapc": 20,
+        "tunisianet": 15,
+        "sbs": 15,
+        "mytek": 20,
+        "spacenet": 15,
         "skymil": 5,
     }
     

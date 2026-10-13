@@ -1,384 +1,373 @@
-# parsers/sbs/sbs_product_parser.py - UPDATED with redirect detection
+# parsers/sbs/sbs_product_parser.py
+"""
+SBS product parser.
+
+Price fields come from the JSON-LD Product block, cross-checked
+against the HTML `.product-price.has-discount` block when present.
+All price strings are normalized through `core.utils.price_cleaner`.
+
+Storage contract:
+    price           = original (strikethrough / "was") price
+    discount_price  = discounted price (what the user pays), 0.0 if no discount
+    discount_amount = price - discount_price (positive), 0.0 if no discount
+
+Price format:
+    Values are cleaned by `clean_price` (currency symbols, NBSPs,
+    thousands separators, decimal commas) and stored as floats.
+    No millime → dinar rescaling is applied here; the raw cleaned
+    number is preserved.
+"""
+from __future__ import annotations
 
 import json
 import re
-from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
-from typing import Dict, Optional, List, Any
+from typing import Any, Dict, Optional
+
+from bs4 import BeautifulSoup
 
 from core.logger import setup_logger
 from core.Web.product_schema import create_product_schema
-from core.utils.price_cleaner import clean_price, clean_price_generic
+from core.utils.price_cleaner import clean_price
 from core.utils.clean_text_parser import (
-    clean_and_decode_text, 
+    clean_and_decode_text,
     normalize_availability,
     clean_product_name,
     clean_brand_name,
     clean_category_name,
-    clean_special_id
+    clean_special_id,
 )
 from core.utils.Dclean_html import clean_html
 from core.utils.cleaning_url_logic import normalize_url
 from core.utils.clean_date_logic import clean_date
-from core.utils.clean_parse_specs import parse_specs
 
 logger = setup_logger("sbs_parser", "parser")
 
 
-def clean_price_sbs(val: Any) -> Optional[float]:
+# ═══════════════════════════════════════════════════════════
+# Price helper
+# ═══════════════════════════════════════════════════════════
+def _clean_price_value(value: Any) -> Optional[float]:
     """
-    Clean SBS price format using the universal price cleaner.
+    Clean a raw price value and return it as a float.
+
+    `clean_price` handles currency symbols, thousands separators,
+    decimal commas and NBSPs. The result is returned unchanged —
+    no rescaling, no rounding to a fixed unit.
+
+    Examples:
+        "2,999,000"  -> 2999000.0
+        "1 299,00"   -> 1299.0
+        "499.000 DT" -> 499000.0
     """
-    if not val:
+    if value is None:
         return None
-    return clean_price(val, decimals=2, currency="TND")
+    cleaned = clean_price(value)
+    if cleaned is None or cleaned <= 0:
+        return None
+    return float(cleaned)
 
 
-def clean_json_for_parsing(text: str) -> str:
-    """
-    Clean JSON string by removing/replacing problematic characters.
-    """
+def _clean_json(text: str) -> str:
     if not text:
         return text
-    
-    # Replace tab characters with spaces
-    text = text.replace('\t', ' ')
-    
-    # Remove other control characters
-    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
-    
-    return text
+    text = text.replace("\t", " ")
+    return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
 
 
 def is_category_page(soup: BeautifulSoup, url: str) -> bool:
-    """
-    Detect if the page is a category page (not a product page).
-    SBS redirects to category when product is removed.
-    """
-    # Check for category page indicators
-    # 1. Check for "Cartes graphiques" or category title
-    category_title = soup.select_one(".page-heading .h1, h1.page-heading")
-    if category_title:
-        # Check if the title contains category words
-        text = category_title.text.lower().strip()
-        # Common category titles: "Cartes graphiques", "Alimentations", etc.
-        # If there's no product name in the title, it's likely a category
-        if "produits" in text or "catégorie" in text or "catégories" in text:
+    """Detect SBS's silent redirect-to-category behaviour."""
+    title = soup.select_one(".page-heading .h1, h1.page-heading")
+    if title:
+        lowered = title.text.lower().strip()
+        if any(w in lowered for w in ("produits", "catégorie", "catégories")):
             return True
-        # If the title has no product-specific words, check other indicators
-    
-    # 2. Check for product grid on the page
-    product_grid = soup.select_one(".products, .product-list, .product-grid")
-    if product_grid and not soup.select_one("#product-details, .product-cover"):
-        # If there's a product grid but no product details, it's a category page
+
+    grid = soup.select_one(".products, .product-list, .product-grid")
+    if grid and not soup.select_one("#product-details, .product-cover"):
         return True
-    
-    # 3. Check if there are multiple products listed
-    product_items = soup.select(".product-miniature, .product-item, .tvproduct-wrapper")
-    if len(product_items) > 1 and not soup.select_one("#product-details"):
+
+    items = soup.select(
+        ".product-miniature, .product-item, .tvproduct-wrapper"
+    )
+    if len(items) > 1 and not soup.select_one("#product-details"):
         return True
-    
-    # 4. Check for "23 produits" text in the page
-    page_text = soup.get_text()
-    if re.search(r'\d+\s+produits?', page_text) and not soup.select_one("#product-details"):
+
+    if (
+        re.search(r"\d+\s+produits?", soup.get_text())
+        and not soup.select_one("#product-details")
+    ):
         return True
-    
+
     return False
 
 
 def is_product_redirected(html: str, url: str) -> bool:
-    """
-    Check if the page is a redirect to a category page.
-    """
     if not html:
         return False
-    
-    # Check if the URL changed (redirect detection)
-    # Since we get the HTML directly, we need to check content
-    
     try:
         soup = BeautifulSoup(html, "lxml")
     except Exception:
         return False
-    
-    # Check if it's a category page
     return is_category_page(soup, url)
 
 
-def parse_sbs_product_page(html: str, url: str, site: str, main_product_id: Optional[str] = None) -> Optional[Dict]:
-    """
-    Parse SBS product page with redirect detection.
-    Returns None if the product is removed/redirected.
-    """
+# ═══════════════════════════════════════════════════════════
+# Main parser
+# ═══════════════════════════════════════════════════════════
+def parse_sbs_product_page(
+    html: str,
+    url: str,
+    site: str,
+    main_product_id: Optional[str] = None,
+) -> Optional[Dict]:
     if not html:
         logger.warning(f"{site} | EMPTY_HTML | {url}")
         return None
-    
-    # ─── CHECK FOR REDIRECT / CATEGORY PAGE ──────────────────
+
     if is_product_redirected(html, url):
         logger.warning(f"{site} | PRODUCT_REMOVED_REDIRECTED | {url}")
         return None
-    
+
     try:
         soup = BeautifulSoup(html, "lxml")
     except Exception as e:
         logger.error(f"{site} | BEAUTIFULSOUP_ERROR | {url} | {e}")
         return None
 
-    # ─── CHECK FOR PRODUCT DETAILS ────────────────────────────
-    # If no product details div, it's not a product page
-    product_details = soup.select_one("#product-details, .product-cover, .product-prices")
+    product_details = soup.select_one(
+        "#product-details, .product-cover, .product-prices"
+    )
     if not product_details:
         logger.warning(f"{site} | NO_PRODUCT_DETAILS | {url}")
         return None
 
-    # Extract product id if not provided
+    # ── Extract the numeric product id if not provided.
     if not main_product_id:
         body = soup.find("body")
         if body:
-            classes = body.get("class", [])
-            for c in classes:
+            for c in body.get("class", []):
                 if "product-id-" in c:
                     main_product_id = c.split("product-id-")[-1]
                     break
-        
-        # Try to extract from URL if still not found
         if not main_product_id:
-            match = re.search(r'/(\d+)(?:/|$)', url)
-            if match:
-                main_product_id = match.group(1)
+            m = re.search(r"/(\d+)(?:/|$)", url)
+            if m:
+                main_product_id = m.group(1)
 
-    # Create product schema
     try:
         product = create_product_schema(site, url, main_product_id)
     except Exception as e:
         logger.error(f"{site} | CREATE_SCHEMA_ERROR | {e}")
         return None
 
-    # =====================================================
-    # FIXED: JSON-LD EXTRACTION - HANDLE MALFORMED JSON
-    # =====================================================
-    json_data = None
-    
-    # Find all JSON-LD scripts
-    scripts = soup.find_all("script", type="application/ld+json")
-    
-    for script in scripts:
+    # ── Locate the Product JSON-LD block.
+    json_data: Optional[Dict] = None
+    for script in soup.find_all("script", type="application/ld+json"):
         if not script.string:
             continue
-        
         try:
-            # Get the raw script content
-            raw_content = script.string
-            
-            # Clean the content before parsing
-            cleaned_content = clean_json_for_parsing(raw_content)
-            
-            # Parse the JSON
-            data = json.loads(cleaned_content)
-            
-            # Check if it's a Product schema
-            if data.get("@type") == "Product":
-                json_data = data
-                logger.debug(f"{site} | FOUND_PRODUCT_JSON")
-                break
-                
+            data = json.loads(_clean_json(script.string))
         except json.JSONDecodeError as e:
             logger.debug(f"{site} | JSON_DECODE_ERROR | {e}")
             continue
-        except Exception as e:
-            logger.debug(f"{site} | JSON_LOAD_ERROR | {e}")
-            continue
+        if isinstance(data, dict) and data.get("@type") == "Product":
+            json_data = data
+            break
 
-    # ─── LOG WHAT WAS FOUND (FOR DEBUGGING) ─────────────────────
-    if json_data:
-        logger.debug(f"{site} | PRODUCT_JSON_FOUND | name={json_data.get('name', '')[:30]}")
-    else:
+    if not json_data:
         logger.warning(f"{site} | NO_PRODUCT_JSON_FOUND | url={url}")
         return None
 
-    # =====================================================
-    # EXTRACT DATA FROM JSON
-    # =====================================================
-    if json_data:
-        try:
-            # Name - using clean_product_name
-            if json_data.get("name"):
-                product["name"] = clean_product_name(json_data["name"])
-            
-            # Description - using clean_html
-            if json_data.get("description"):
-                product["description"] = clean_html(json_data["description"])
-            
-            # Category - using clean_category_name
-            if json_data.get("category"):
-                product["category"] = clean_category_name(json_data["category"])
-            
-            # Brand - using clean_brand_name
-            brand = json_data.get("brand", {})
-            if isinstance(brand, dict):
-                product["brand"] = clean_brand_name(brand.get("name"))
-            elif isinstance(brand, str):
-                product["brand"] = clean_brand_name(brand)
-            
-            # SKU / MPN - using clean_special_id
-            if json_data.get("mpn"):
-                product["special_id"] = clean_special_id(json_data["mpn"])
-            elif json_data.get("sku"):
-                product["special_id"] = clean_special_id(json_data["sku"])
-            
-            # Offers
-            offers = json_data.get("offers", {})
-            if isinstance(offers, list) and offers:
-                offers = offers[0]
-            
-            if offers:
-                # Price - using clean_price_sbs
-                if offers.get("price"):
-                    product["price"] = clean_price_sbs(offers["price"])
-                
-                # Price valid until - using clean_date
-                if offers.get("priceValidUntil"):
-                    product["price_valid_until"] = clean_date(offers["priceValidUntil"])
-                else:
-                    # Default: 7 days from now
-                    product["price_valid_until"] = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
-                
-                # Availability - using normalize_availability
-                if offers.get("availability"):
-                    product["availability"] = normalize_availability(offers["availability"].split("/")[-1])
-            
-            # Images - using normalize_url
-            images = json_data.get("image", [])
-            if isinstance(images, str):
-                images = [images]
-            elif isinstance(images, dict):
-                if images.get("url"):
-                    images = [images["url"]]
-                else:
-                    images = []
-            
-            if images:
-                product["images"] = [normalize_url(img) for img in images if img]
-                product["main_image"] = product["images"][0] if product["images"] else None
-            
-        except Exception as e:
-            logger.error(f"{site} | JSON_PARSING_ERROR | {e}")
+    # ── Descriptive fields.
+    if json_data.get("name"):
+        product["name"] = clean_product_name(json_data["name"])
+    if json_data.get("description"):
+        product["description"] = clean_html(json_data["description"])
+    if json_data.get("category"):
+        product["category"] = clean_category_name(json_data["category"])
 
-    # =====================================================
-    # PRICE LOGIC - Handle discount from HTML
-    # =====================================================
-    json_price = product.get("price")
-    
-    # Look for discount block in HTML
+    brand = json_data.get("brand")
+    if isinstance(brand, dict):
+        product["brand"] = clean_brand_name(brand.get("name"))
+    elif isinstance(brand, str):
+        product["brand"] = clean_brand_name(brand)
+
+    if json_data.get("mpn"):
+        product["special_id"] = clean_special_id(json_data["mpn"])
+    elif json_data.get("sku"):
+        product["special_id"] = clean_special_id(json_data["sku"])
+
+    # ── Offers block: price, availability, validity.
+    offers = json_data.get("offers", {})
+    if isinstance(offers, list) and offers:
+        offers = offers[0]
+
+    json_price: Optional[float] = None
+    if isinstance(offers, dict):
+        json_price = _clean_price_value(offers.get("price"))
+
+        if offers.get("priceValidUntil"):
+            product["price_valid_until"] = clean_date(
+                offers["priceValidUntil"]
+            )
+        else:
+            product["price_valid_until"] = (
+                datetime.now() + timedelta(days=7)
+            ).strftime("%Y-%m-%d")
+
+        availability = offers.get("availability")
+        if availability:
+            product["availability"] = normalize_availability(
+                availability.split("/")[-1]
+            )
+
+    # ── Images.
+    images = json_data.get("image", [])
+    if isinstance(images, str):
+        images = [images]
+    elif isinstance(images, dict):
+        images = [images["url"]] if images.get("url") else []
+    if images:
+        product["images"] = [normalize_url(i) for i in images if i]
+        product["main_image"] = product["images"][0]
+
+    # ── PRICE LOGIC.
+    #
+    # Storage contract:
+    #   price           = original (strikethrough) price
+    #   discount_price  = discounted price (what the user pays), 0.0 if none
+    #   discount_amount = price - discount_price, positive, 0.0 if none
+    #
+    # JSON-LD carries the *current* (discounted) price. The HTML
+    # `.product-price.has-discount` block carries BOTH the current
+    # and the original (strikethrough) price when a discount is on.
+    html_current: Optional[float] = None
+    html_original: Optional[float] = None
+
     discount_block = soup.select_one(".product-price.has-discount")
-    
     if discount_block:
-        # Try to get discounted price from HTML
-        regular_price_el = soup.select_one(".product-discount .regular-price")
-        if regular_price_el:
-            html_discounted_price = clean_price_sbs(regular_price_el.text)
-            
-            if html_discounted_price:
-                # SBS discount convention: 
-                # price = discounted price (main price)
-                # discount_price = original price (for reference)
-                product["price"] = html_discounted_price
-                product["discount_price"] = json_price if json_price else 0.0
-                
-                if json_price and html_discounted_price:
-                    product["discount_amount"] = round(html_discounted_price - json_price, 2)
-                else:
-                    product["discount_amount"] = 0.0
-    
-    # If no discount, use JSON price
-    if not discount_block:
-        product["discount_price"] = 0.0
-        product["discount_amount"] = 0.0
+        regular_el = discount_block.select_one(
+            ".product-discount .regular-price"
+        )
+        current_el = discount_block.select_one(
+            ".current-price span[content], .current-price .price"
+        )
+        if current_el:
+            html_current = _clean_price_value(
+                current_el.get("content") or current_el.text
+            )
+        if regular_el:
+            html_original = _clean_price_value(regular_el.text)
 
-    # =====================================================
-    # SHORT DESCRIPTION / SPECS - using parse_specs
-    # =====================================================
+    # Prefer the HTML original (strikethrough) when available; the
+    # JSON price is authoritative for the *current* price.
+    original_price = html_original
+    discounted_price = json_price if json_price is not None else html_current
+
+    if json_price is not None and json_price > 0:
+        discounted_price = json_price
+
+    # Sanity: if we have both an original and a current, the original
+    # must be the larger one. If they're inverted, swap them.
+    if (
+        original_price is not None
+        and discounted_price is not None
+        and original_price < discounted_price
+    ):
+        original_price, discounted_price = discounted_price, original_price
+
+    # No discount case: original == current, and there's no separate
+    # discounted price to store.
+    if original_price is None:
+        original_price = discounted_price
+        if html_current is None and html_original is None:
+            discounted_price = None
+
+    # Final values (already cleaned, no rescaling).
+    price_value = original_price or 0.0
+
+    if discounted_price is not None and discounted_price < price_value:
+        discount_price_value = discounted_price
+        discount_amount_value = round(
+            max(price_value - discount_price_value, 0.0), 2
+        )
+    else:
+        # No discount → discount fields are zeroed.
+        discount_price_value = 0.0
+        discount_amount_value = 0.0
+
+    product["price"] = round(price_value, 2)
+    product["discount_price"] = round(discount_price_value, 2)
+    product["discount_amount"] = discount_amount_value
+
+    # ── SHORT DESCRIPTION (attributes table, then description list).
     product["short_description"] = {}
-    
-    # Try to get specs from table
+
     specs_table = soup.select_one("table.data.table.additional-attributes")
     if specs_table:
-        rows = specs_table.find_all("tr")
-        for row in rows:
-            th = row.find("th")
-            td = row.find("td")
-            if th and td:
-                key = clean_and_decode_text(th.text)
-                value = clean_and_decode_text(td.text)
-                if key and value:
-                    product["short_description"][key] = value
-    
-    # Fallback: get specs from product description short
+        for row in specs_table.find_all("tr"):
+            th, td = row.find("th"), row.find("td")
+            if not th or not td:
+                continue
+            key = clean_and_decode_text(th.text)
+            value = clean_and_decode_text(td.text)
+            if key and value:
+                product["short_description"][key] = value
+
     if not product["short_description"] and main_product_id:
-        rows = soup.select(f"#product-description-short-{main_product_id} tr")
-        for row in rows:
+        for row in soup.select(
+            f"#product-description-short-{main_product_id} tr"
+        ):
             cols = row.find_all("td")
             if len(cols) >= 2:
                 value = clean_and_decode_text(cols[1].text)
                 if value:
-                    key = f"spec_{len(product['short_description']) + 1}"
-                    product["short_description"][key] = value
-    
-    # Second fallback: get specs from list items
+                    idx = len(product["short_description"]) + 1
+                    product["short_description"][f"spec_{idx}"] = value
+
     if not product["short_description"]:
-        desc_items = soup.select("#product-description-short li")
-        for li in desc_items:
+        for li in soup.select("#product-description-short li"):
             text = clean_and_decode_text(li.text)
             if text:
-                key = f"spec_{len(product['short_description']) + 1}"
-                product["short_description"][key] = text
-    
-    # =====================================================
-    # VALIDATE PRODUCT
-    # =====================================================
+                idx = len(product["short_description"]) + 1
+                product["short_description"][f"spec_{idx}"] = text
+
+    # ── Validation.
     if not product.get("name"):
-        logger.warning(f"{site} | DETAILS_NO_NAME | {main_product_id} | url={url}")
+        logger.warning(f"{site} | DETAILS_NO_NAME | {main_product_id}")
         return None
-    
-    if not product.get("price") or product.get("price") <= 0:
-        logger.warning(f"{site} | DETAILS_NO_PRICE | {main_product_id} | price={product.get('price')}")
+    if not product.get("price") or product["price"] <= 0:
+        logger.warning(
+            f"{site} | DETAILS_NO_PRICE | {main_product_id} | "
+            f"price={product.get('price')}"
+        )
         return None
-    
     if not product.get("url"):
         product["url"] = normalize_url(url)
 
-    # =====================================================
-    # LOG SUCCESS
-    # =====================================================
-    if product.get("name"):
-        logger.info(f"{site} | PRODUCT_PARSED | {product['name'][:50]}... | id={main_product_id}")
-    
+    logger.info(
+        f"{site} | PRODUCT_PARSED | "
+        f"id={main_product_id} | "
+        f"price={product['price']} | "
+        f"discount_price={product['discount_price']} | "
+        f"discount_amount={product['discount_amount']}"
+    )
     return product
 
 
-def fast_check_sbs_product(url: str, product_id: Optional[str] = None) -> Optional[Dict]:
-    """
-    Fast check function for SBS products.
-    """
-    from core.Web.http_client import get
-    
+def fast_check_sbs_product(
+    url: str, product_id: Optional[str] = None
+) -> Optional[Dict]:
+    """Monitoring helper (fetch + parse)."""
+    from core.Web.smart_requester import SmartRequester
+
     try:
-        html = get(
-            url=url,
-            max_retries=4,
-            timeout=45,
-            requests_per_minute=10,
-            use_referer=True,
-            verify_ssl=True
-        )
-        
+        html = SmartRequester(site_name="sbs").get_html(url, timeout=45)
         if not html:
-            logger.warning(f"SBS_FAST | FETCH_FAILED | product_id={product_id}")
+            logger.warning(f"SBS_FAST | FETCH_FAILED | id={product_id}")
             return None
-        
         return parse_sbs_product_page(html, url, "sbs", product_id)
-        
     except Exception as e:
-        logger.error(f"SBS_FAST | CHECK_ERROR | product_id={product_id} | {e}")
+        logger.error(f"SBS_FAST | CHECK_ERROR | id={product_id} | {e}")
         return None

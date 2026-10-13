@@ -1,113 +1,223 @@
 # parsers/mytek/mytek_product_parser.py
+"""
+Mytek product parser.
+
+Price extraction is script-only: the Magento `text/x-magento-init`
+payload. There is deliberately no DOM fallback for prices. If the
+script is missing, is malformed, or does not carry the product's
+price, the parser raises (scraper) or reports a price error
+(monitor) rather than emit a wrong number.
+
+Availability and SKU still use the DOM because the Magento payload
+does not carry them.
+"""
+from __future__ import annotations
+
+import json
+import re
+from typing import Any, Optional
 
 from bs4 import BeautifulSoup
+
 from core.logger import setup_logger
-from core.utils.clean_text_parser import clean_and_decode_text, normalize_availability
-from core.utils.price_cleaner import clean_price
-from core.Web.product_schema import create_product_schema
+from core.utils.clean_text_parser import (
+    clean_and_decode_text,
+    normalize_availability,
+)
 from core.utils.Dclean_html import clean_html
 from core.utils.cleaning_url_logic import normalize_url
-
-import re
-import json
+from core.Web.product_schema import create_product_schema
 
 logger = setup_logger("mytek", "scraper")
 
+PARSER_VERSION = "mytek_product_parser_v3_magento_only"
 
-def parse_mytek_product_page(html, url, site, source, product_id=None):
+
+# ═══════════════════════════════════════════════════════════
+# MAGENTO PRICE EXTRACTION (script only — no DOM fallback)
+# ═══════════════════════════════════════════════════════════
+def _coerce_float(value: Any) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _iter_magento_payloads(soup: BeautifulSoup):
     """
-    Parse Mytek product page with proper cleaning using utility functions.
-    
-    Args:
-        html: HTML content of the product page
-        url: Product URL
-        site: Site name (MYTEK)
-        source: Category source
-        product_id: Product ID from listing
-    
-    Returns:
-        Dict: Parsed product data in canonical schema
+    Yield every parsed JSON payload from `text/x-magento-init` scripts.
+
+    Fixes the two failure modes that silently returned None before:
+
+    1. `script.string` is unreliable on `<script>` tags whose content
+       has leading whitespace or is wrapped. We use
+       `script.string or script.get_text()`.
+
+    2. Mytek sometimes ships more than one
+       `text/x-magento-init` script on a product page (theme,
+       review widget, recently-viewed widget). `soup.find(...)`
+       grabs the first one, which is often the wrong one. We
+       iterate all of them.
     """
-    soup = BeautifulSoup(html, "lxml")
-    
-    # Create base product schema
-    product = create_product_schema(site, url, product_id)
-    
-    # =====================================================
-    # NAME
-    # =====================================================
-    name_tag = soup.find("h1", class_="page-title")
-    if name_tag:
-        product["name"] = clean_and_decode_text(name_tag.text)
-    
-    # =====================================================
-    # PRICE BLOCK - Using price_cleaner utility
-    # =====================================================
-    price_box = None
-    
-    # Try to find by data-product-id first
-    if product_id:
-        price_box = soup.select_one(f'div.price-box.price-final_price[data-product-id="{product_id}"]')
-    
-    # Fallback: find any price box
-    if not price_box:
-        price_box = soup.find("div", class_="price-box", attrs={"data-role": "priceBox"})
-    
-    if price_box:
-        final_price = None
-        old_price = None
-        
-        # Final price
-        final_span = price_box.find("span", {"data-price-type": "finalPrice"})
-        if final_span:
-            final_price = clean_price(final_span.get("data-price-amount"))
-        
-        # Old price (for discounts)
-        old_span = price_box.find("span", {"data-price-type": "oldPrice"})
-        if old_span:
-            old_price = clean_price(old_span.get("data-price-amount"))
-        
-        # Special Mytek price format: handle price text like "169,000 DT"
-        if final_price is None:
-            price_span = price_box.find("span", class_="price")
-            if price_span:
-                price_text = price_span.text.strip()
-                # Clean the price text
-                final_price = clean_price(price_text)
-        
-        # Apply price rules
-        if old_price and final_price and old_price > final_price:
-            # Discount case: original price is higher than final price
-            product["price"] = old_price
-            product["discount_price"] = final_price
-            product["discount_amount"] = round(old_price - final_price, 2)
+    scripts = soup.find_all("script", {"type": "text/x-magento-init"})
+    for script in scripts:
+        raw = script.string or script.get_text()
+        if not raw:
+            continue
+        raw = raw.strip()
+        if not raw:
+            continue
+        # Some Magento builds wrap the JSON in HTML comment markers.
+        raw = re.sub(r"^<!--\s*|\s*-->$", "", raw).strip()
+        try:
+            yield json.loads(raw)
+        except (json.JSONDecodeError, TypeError) as exc:
+            logger.debug(
+                f"MAGENTO_PAYLOAD_PARSE_FAILED | "
+                f"preview={raw[:120]!r} error={exc}"
+            )
+            continue
+
+
+def _extract_price_info_from_items(items: dict) -> Optional[dict]:
+    """Extract normalized price info from a Magento `items` dict."""
+    if not isinstance(items, dict) or not items:
+        return None
+
+    for _item_id, item in items.items():
+        if not isinstance(item, dict):
+            continue
+        price_info = item.get("price_info") or {}
+        if not isinstance(price_info, dict):
+            continue
+
+        final_price = _coerce_float(price_info.get("final_price"))
+        regular_price = _coerce_float(price_info.get("regular_price"))
+
+        if final_price is None and regular_price is None:
+            continue
+
+        # Effective vs original:
+        #   regular > final  -> discount active
+        #   else             -> no discount
+        if (
+            regular_price is not None
+            and final_price is not None
+            and regular_price > final_price
+        ):
+            price = regular_price
+            discount_price = final_price
+            discount_amount = round(max(price - discount_price, 0.0), 2)
         else:
-            # No discount
-            product["price"] = final_price or 0
-            product["discount_price"] = 0
-            product["discount_amount"] = 0
-    
-    # =====================================================
-    # SKU / SPECIAL ID
-    # =====================================================
-    sku_block = soup.find("div", class_="product-info-stock-sku")
-    if sku_block:
-        sku_value = sku_block.find("div", class_="value")
-        if sku_value:
-            product["special_id"] = clean_and_decode_text(sku_value.text)
-    
-    # If SKU not found, try from meta
-    if not product["special_id"]:
-        sku_meta = soup.find("meta", {"property": "product:retailer_item_id"})
-        if sku_meta:
-            product["special_id"] = clean_and_decode_text(sku_meta.get("content", ""))
-    
-    # =====================================================
-    # AVAILABILITY - Using normalize_availability utility
-    # =====================================================
+            price = final_price if final_price is not None else (regular_price or 0.0)
+            discount_price = 0.0
+            discount_amount = 0.0
+
+        price = float(price or 0.0)
+        discount_price = float(discount_price or 0.0)
+        
+        return {
+            "price": price,
+            "discount_price": discount_price,
+            "discount_amount": discount_amount,
+        }
+
+    return None
+
+
+def _find_price_block(payload: Any) -> Optional[dict]:
+    """
+    Walk one `text/x-magento-init` payload and return normalized price
+    info, or None.
+
+    Two shapes are handled:
+
+    Shape A — provider at the top of "*":
+        { "*": { "Magento_Catalog/js/product/view/provider": {
+            "data": { "items": {...} }
+        } } }
+
+    Shape B — provider nested deeper (some widget wrappers):
+        { "*": { "some/other/widget": { ... },
+                 "Magento_Catalog/js/product/view/provider": {
+            "data": { "items": {...} }
+        } } }
+    """
+    if not isinstance(payload, dict):
+        return None
+
+    # Try the standard "*" branch first.
+    for key in ("*", ""):
+        branch = payload.get(key) if key else payload
+        if not isinstance(branch, dict):
+            continue
+        provider = branch.get("Magento_Catalog/js/product/view/provider")
+        if isinstance(provider, dict):
+            data = provider.get("data")
+            if isinstance(data, dict):
+                items = data.get("items")
+                if isinstance(items, dict):
+                    result = _extract_price_info_from_items(items)
+                    if result is not None:
+                        return result
+
+    # Fallback: scan every value under "*" for the provider key. This
+    # catches payloads where the provider sits one level deeper.
+    star = payload.get("*")
+    if isinstance(star, dict):
+        for _widget_key, widget in star.items():
+            if not isinstance(widget, dict):
+                continue
+            provider = widget.get("Magento_Catalog/js/product/view/provider")
+            if not isinstance(provider, dict):
+                continue
+            data = provider.get("data")
+            if not isinstance(data, dict):
+                continue
+            items = data.get("items")
+            if not isinstance(items, dict):
+                continue
+            result = _extract_price_info_from_items(items)
+            if result is not None:
+                return result
+
+    return None
+
+
+def _extract_magento_price_info(soup: BeautifulSoup) -> Optional[dict]:
+    """
+    Return {price, discount_price, discount_amount} from the Magento
+    `text/x-magento-init` payload, or None.
+
+    No DOM fallback. If this returns None the caller must treat it as
+    a hard failure and not emit a price.
+    """
+    payloads_scanned = 0
+    for payload in _iter_magento_payloads(soup):
+        payloads_scanned += 1
+        result = _find_price_block(payload)
+        if result is not None:
+            logger.debug(
+                f"MAGENTO_PRICE_FOUND | payloads_scanned={payloads_scanned} "
+                f"price={result['price']} "
+                f"discount_price={result['discount_price']}"
+            )
+            return result
+
+    logger.warning(
+        f"MAGENTO_PRICE_BLOCK_MISSING | payloads_scanned={payloads_scanned}"
+    )
+    return None
+
+
+# ═══════════════════════════════════════════════════════════
+# AVAILABILITY (DOM, unchanged from before)
+# ═══════════════════════════════════════════════════════════
+def _extract_availability(soup: BeautifulSoup) -> Optional[str]:
     availability_text = None
-    
-    # Method 1: Schema.org availability link
+
     availability_link = soup.find("link", {"itemprop": "availability"})
     if availability_link:
         href = availability_link.get("href", "")
@@ -117,15 +227,12 @@ def parse_mytek_product_page(html, url, site, source, product_id=None):
             availability_text = "OutOfStock"
         elif "PreOrder" in href:
             availability_text = "OnOrder"
-    
-    # Method 2: Stock status div
+
     if not availability_text:
         stock_div = soup.find("div", class_="stock")
         if stock_div:
-            stock_text = stock_div.text.strip()
-            availability_text = normalize_availability(stock_text)
-    
-    # Method 3: From product data attributes
+            availability_text = normalize_availability(stock_div.text.strip())
+
     if not availability_text:
         product_data = soup.find("div", {"data-product": True})
         if product_data:
@@ -135,32 +242,135 @@ def parse_mytek_product_page(html, url, site, source, product_id=None):
                     data = json.loads(data_json)
                     stock_status = data.get("stock_status", "")
                     availability_text = normalize_availability(stock_status)
-            except:
+            except Exception:
                 pass
-    
-    # Method 4: From availability table row
+
     if not availability_text:
         table = soup.find("table", class_="data table additional-attributes")
         if table:
-            rows = table.find_all("tr")
-            for row in rows:
+            for row in table.find_all("tr"):
                 th = row.find("th")
                 td = row.find("td")
-                if th and td:
-                    if "disponibilit" in th.text.lower():
-                        availability_text = normalize_availability(td.text)
-                        break
-    
-    product["availability"] = availability_text or "OutOfStock"
-    
-    # =====================================================
-    # BRAND
-    # =====================================================
+                if th and td and "disponibilit" in th.text.lower():
+                    availability_text = normalize_availability(td.text)
+                    break
+
+    return availability_text or "OutOfStock"
+
+
+# ═══════════════════════════════════════════════════════════
+# SKU
+# ═══════════════════════════════════════════════════════════
+def _extract_sku(soup: BeautifulSoup) -> Optional[str]:
+    sku_block = soup.find("div", class_="product-info-stock-sku")
+    if sku_block:
+        sku_value = sku_block.find("div", class_="value")
+        if sku_value:
+            sku = clean_and_decode_text(sku_value.text)
+            if sku:
+                return sku
+
+    sku_meta = soup.find("meta", {"property": "product:retailer_item_id"})
+    if sku_meta:
+        sku = clean_and_decode_text(sku_meta.get("content", ""))
+        if sku:
+            return sku
+
+    return None
+
+
+# ═══════════════════════════════════════════════════════════
+# ATTRIBUTES TABLE
+# ═══════════════════════════════════════════════════════════
+def _parse_attributes_table(soup: BeautifulSoup, product: dict, source: str) -> dict:
+    table = soup.find("table", class_="data table additional-attributes")
+    if not table:
+        if not product.get("short_description"):
+            product["short_description"] = {}
+        return product
+
+    if not product.get("short_description"):
+        product["short_description"] = {}
+
+    category_found = False
+
+    for row in table.find_all("tr"):
+        th = row.find("th")
+        td = row.find("td")
+        if not th or not td:
+            continue
+
+        key = clean_and_decode_text(th.text)
+        value = clean_and_decode_text(td.text)
+        if not value:
+            continue
+
+        key_lower = key.lower()
+        product["short_description"][key] = value
+
+        if "marque" in key_lower and not product.get("brand"):
+            product["brand"] = value
+
+        if key_lower == "type" and not category_found:
+            product["category"] = value
+            category_found = True
+
+    if not product.get("category"):
+        product["category"] = source
+
+    return product
+
+
+# ═══════════════════════════════════════════════════════════
+# MAIN PARSER
+# ═══════════════════════════════════════════════════════════
+def parse_mytek_product_page(
+    html: str,
+    url: str,
+    site: str,
+    source: str,
+    product_id: Any = None,
+) -> dict:
+    """
+    Parse a Mytek product page.
+
+    Raises ValueError if the Magento price block is missing. This is
+    deliberate: the caller would otherwise persist a wrong price.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    product = create_product_schema(site, url, product_id)
+
+    # ── NAME
+    name_tag = soup.find("h1", class_="page-title")
+    if name_tag:
+        product["name"] = clean_and_decode_text(name_tag.text)
+
+    # ── PRICE (Magento script only)
+    price_info = _extract_magento_price_info(soup)
+    if price_info is None:
+        raise ValueError(
+            f"Mytek parser: no Magento price block found "
+            f"(product_id={product_id!r}, url={url!r}). "
+            f"Refusing to emit a price derived from the DOM."
+        )
+
+    product["price"] = price_info["price"]
+    product["discount_price"] = price_info["discount_price"]
+    product["discount_amount"] = price_info["discount_amount"]
+
+    # ── SKU / SPECIAL ID
+    sku = _extract_sku(soup)
+    if sku:
+        product["special_id"] = sku
+
+    # ── AVAILABILITY
+    product["availability"] = _extract_availability(soup)
+
+    # ── BRAND
     brand_meta = soup.find("meta", {"property": "product:brand"})
     if brand_meta:
         product["brand"] = clean_and_decode_text(brand_meta.get("content", ""))
-    
-    # Fallback: from product data
+
     if not product["brand"]:
         product_data = soup.find("div", {"data-product": True})
         if product_data:
@@ -169,33 +379,25 @@ def parse_mytek_product_page(html, url, site, source, product_id=None):
                 if data_json:
                     data = json.loads(data_json)
                     product["brand"] = clean_and_decode_text(data.get("brand", ""))
-            except:
+            except Exception:
                 pass
-    
-    # Fallback: from attributes table
+
     if not product["brand"]:
         product = _parse_attributes_table(soup, product, source)
-    
-    # =====================================================
-    # DESCRIPTION - Using clean_html utility
-    # =====================================================
-    # Method 1: Meta description
+
+    # ── DESCRIPTION
     meta_desc = soup.find("meta", {"property": "og:description"})
     if meta_desc:
         desc = meta_desc.get("content", "")
-        # Remove "Retrait..." and other unwanted text
         desc = desc.split("Retrait")[0]
         desc = desc.split("En savoir")[0]
-        desc = desc.strip()
-        product["description"] = clean_html(desc)
-    
-    # Method 2: Product description div
+        product["description"] = clean_html(desc.strip())
+
     if not product["description"]:
         desc_div = soup.find("div", class_="product-description")
         if desc_div:
             product["description"] = clean_html(desc_div.text)
-    
-    # Method 3: Description from product data
+
     if not product["description"]:
         product_data = soup.find("div", {"data-product": True})
         if product_data:
@@ -204,35 +406,27 @@ def parse_mytek_product_page(html, url, site, source, product_id=None):
                 if data_json:
                     data = json.loads(data_json)
                     product["description"] = clean_html(data.get("description", ""))
-            except:
+            except Exception:
                 pass
-    
-    # =====================================================
-    # SHORT DESCRIPTION / SPECS - From attributes table
-    # =====================================================
+
+    # ── ATTRIBUTES TABLE (fills short_description, and possibly brand/category)
     product = _parse_attributes_table(soup, product, source)
-    
-    # =====================================================
-    # IMAGES
-    # =====================================================
-    images = []
-    main_image = None
-    
-    # Method 1: Meta image
+
+    # ── IMAGES
+    images: list[str] = []
+    main_image: Optional[str] = None
+
     meta_img = soup.find("meta", property="og:image")
     if meta_img and meta_img.get("content"):
         main_image = normalize_url(meta_img["content"].split("?")[0])
-    
-    # Method 2: Product image gallery
-    gallery_images = soup.select(".product-image-gallery img")
-    for img in gallery_images:
+
+    for img in soup.select(".product-image-gallery img"):
         img_url = img.get("src") or img.get("data-src")
         if img_url:
             img_url = normalize_url(img_url.split("?")[0])
             if img_url and img_url not in images:
                 images.append(img_url)
-    
-    # Method 3: Product image from container
+
     if not images:
         product_img = soup.select_one(".product-image-container img")
         if product_img:
@@ -241,182 +435,93 @@ def parse_mytek_product_page(html, url, site, source, product_id=None):
                 img_url = normalize_url(img_url.split("?")[0])
                 if img_url and img_url not in images:
                     images.append(img_url)
-    
-    # Set main image if not set
+
     if not main_image and images:
         main_image = images[0]
-    
+
     product["main_image"] = main_image
     product["images"] = images
-    
-    # =====================================================
-    # PRICE VALID UNTIL
-    # =====================================================
+
+    # ── PRICE VALID UNTIL
     valid_until = soup.find("meta", {"property": "product:price:valid_until"})
     if valid_until:
         product["price_valid_until"] = valid_until.get("content")
-    
-    # =====================================================
-    # CATEGORY - From breadcrumbs or attributes
-    # =====================================================
+
+    # ── CATEGORY
     if not product.get("category"):
-        # Try from breadcrumbs
         breadcrumbs = soup.select(".breadcrumbs .items .item")
         if breadcrumbs:
-            # Get the last breadcrumb (usually the category)
-            last_crumb = breadcrumbs[-1]
-            category_text = last_crumb.text.strip()
+            category_text = breadcrumbs[-1].text.strip()
             if category_text:
                 product["category"] = clean_and_decode_text(category_text)
-    
+
     if not product.get("category"):
         product["category"] = source
-    
-    # =====================================================
-    # MAIN_PRODUCT_ID - Ensure it's set
-    # =====================================================
+
+    # ── MAIN_PRODUCT_ID / URL
     if not product["main_product_id"] and product_id:
         product["main_product_id"] = str(product_id)
-    
-    # =====================================================
-    # URL - Normalize
-    # =====================================================
+
     product["url"] = normalize_url(url)
-    
-    logger.info(f"{site} | PRODUCT_PARSED | {product['main_product_id']}")
-    
+
+    logger.info(
+        f"{site} | PRODUCT_PARSED | "
+        f"id={product['main_product_id']} | "
+        f"price={product['price']} | "
+        f"discount={product['discount_price']}"
+    )
+
     return product
 
 
-def _parse_attributes_table(soup, product, source):
+# ═══════════════════════════════════════════════════════════
+# FAST CHECK (monitoring worker)
+# ═══════════════════════════════════════════════════════════
+def fast_check_mytek_product(
+    html: str,
+    url: str | None = None,
+    main_product_id: Any = None,
+) -> dict:
     """
-    Parse the attributes table and extract brand, category, and short_description.
-    """
-    table = soup.find("table", class_="data table additional-attributes")
-    
-    if not table:
-        # If no table, set default short_description
-        if not product.get("short_description"):
-            product["short_description"] = {}
-        return product
-    
-    # Initialize short_description if not exists
-    if not product.get("short_description"):
-        product["short_description"] = {}
-    
-    rows = table.find_all("tr")
-    category_found = False
-    
-    for row in rows:
-        th = row.find("th")
-        td = row.find("td")
-        
-        if not th or not td:
-            continue
-        
-        key = clean_and_decode_text(th.text)
-        value = clean_and_decode_text(td.text)
-        
-        if not value:
-            continue
-        
-        key_lower = key.lower()
-        
-        # Store raw structure in short_description
-        product["short_description"][key] = value
-        
-        # Extract brand
-        if "marque" in key_lower and not product.get("brand"):
-            product["brand"] = value
-        
-        # Extract category (first "type" row only)
-        if key_lower == "type" and not category_found:
-            product["category"] = value
-            category_found = True
-    
-    # If category not found in table, use source
-    if not product.get("category"):
-        product["category"] = source
-    
-    return product
+    Fast product check for the monitoring pipeline.
 
-
-def fast_check_mytek_product(html, url=None, main_product_id=None):
-    """
-    Fast product checker for monitoring - extracts only essential fields.
+    Price fields are script-only. On failure `price` is set to None
+    and a `price_error` key is added, so the monitor can skip the
+    comparison instead of recording a bogus change.
     """
     soup = BeautifulSoup(html, "lxml")
-    
-    result = {}
-    
-    # Extract price
-    price_box = None
-    if main_product_id:
-        price_box = soup.select_one(f'div.price-box.price-final_price[data-product-id="{main_product_id}"]')
-    
-    if not price_box:
-        price_box = soup.find("div", class_="price-box", attrs={"data-role": "priceBox"})
-    
-    if price_box:
-        final_price = None
-        final_span = price_box.find("span", {"data-price-type": "finalPrice"})
-        if final_span:
-            final_price = clean_price(final_span.get("data-price-amount"))
-        
-        if final_price is None:
-            price_span = price_box.find("span", class_="price")
-            if price_span:
-                final_price = clean_price(price_span.text)
-        
-        result["price"] = final_price or 0
-        
-        # Check for discount
-        old_span = price_box.find("span", {"data-price-type": "oldPrice"})
-        if old_span:
-            old_price = clean_price(old_span.get("data-price-amount"))
-            if old_price and old_price > result["price"]:
-                result["discount_price"] = result["price"]
-                result["price"] = old_price
-                result["discount_amount"] = round(old_price - result["discount_price"], 2)
-            else:
-                result["discount_price"] = 0
-                result["discount_amount"] = 0
-        else:
-            result["discount_price"] = 0
-            result["discount_amount"] = 0
-    
-    # Extract availability
-    availability_text = None
-    availability_link = soup.find("link", {"itemprop": "availability"})
-    if availability_link:
-        href = availability_link.get("href", "")
-        if "InStock" in href:
-            availability_text = "InStock"
-        elif "OutOfStock" in href:
-            availability_text = "OutOfStock"
-    
-    if not availability_text:
-        stock_div = soup.find("div", class_="stock")
-        if stock_div:
-            availability_text = normalize_availability(stock_div.text)
-    
-    result["availability"] = availability_text or "OutOfStock"
-    
-    # Extract special_id (SKU)
-    sku_block = soup.find("div", class_="product-info-stock-sku")
-    if sku_block:
-        sku_value = sku_block.find("div", class_="value")
-        if sku_value:
-            result["special_id"] = clean_and_decode_text(sku_value.text)
-    
-    if not result.get("special_id"):
-        sku_meta = soup.find("meta", {"property": "product:retailer_item_id"})
-        if sku_meta:
-            result["special_id"] = clean_and_decode_text(sku_meta.get("content", ""))
-    
-    # Extract price_valid_until
+    result: dict = {}
+
+    # ── PRICE
+    price_info = _extract_magento_price_info(soup)
+    if price_info is None:
+        logger.error(
+            f"MAGENTO_PRICE_BLOCK_MISSING | "
+            f"id={main_product_id} url={url}"
+        )
+        result["price"] = None
+        result["discount_price"] = None
+        result["discount_amount"] = None
+        result["price_error"] = "magento_price_block_missing"
+    else:
+        result["price"] = price_info["price"]
+        result["discount_price"] = price_info["discount_price"]
+        result["discount_amount"] = price_info["discount_amount"]
+
+    # ── AVAILABILITY
+    result["availability"] = _extract_availability(soup)
+
+    # ── SKU
+    sku = _extract_sku(soup)
+    if sku:
+        result["special_id"] = sku
+
+    # ── PRICE VALID UNTIL
     valid_until = soup.find("meta", {"property": "product:price:valid_until"})
     if valid_until:
         result["price_valid_until"] = valid_until.get("content")
-    
+
     return result
+
+
+logger.info(f"Loaded {PARSER_VERSION}")

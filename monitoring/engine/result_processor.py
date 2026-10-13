@@ -35,7 +35,7 @@ class ResultProcessor:
     PROTECTED_FIELDS = [
         "url", "name", "brand", "category", "main_product_id",
         "site", "monitoring_priority", "monitoring_group",
-        "is_enabled", "status"
+        "is_enabled",
     ]
     
     # Fields that monitoring CAN update
@@ -366,7 +366,6 @@ class ResultProcessor:
                         cursor.execute("""
                             UPDATE products 
                             SET is_enabled = FALSE, 
-                                status = 'disabled',
                                 last_updated_at = NOW()
                             WHERE id = %s
                         """, (product_uuid,))
@@ -382,8 +381,7 @@ class ResultProcessor:
                         product["consecutive_errors"] = new_count
                         if is_disabled:
                             product["is_enabled"] = False
-                            product["status"] = "disabled"
-                        
+
                         # Verify URL is preserved
                         if not product.get("url"):
                             logger.error(f"{site.upper()} | URL_LOST | {main_product_id}")

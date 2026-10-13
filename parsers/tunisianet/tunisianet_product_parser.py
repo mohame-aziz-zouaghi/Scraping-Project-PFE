@@ -16,7 +16,7 @@ from core.utils.clean_text_parser import (
     clean_json_string,
     is_empty_or_placeholder
 )
-from core.utils.price_cleaner import clean_price_tunisianet, validate_price
+from core.utils.price_cleaner import clean_price, validate_price
 
 logger = setup_logger("tunisianet_parser", "scraper")
 
@@ -186,7 +186,7 @@ def extract_prices_from_json(
     
     price_without_reduction = data.get(price_field)
     if price_without_reduction:
-        result["price"] = clean_price_tunisianet(price_without_reduction, decimals) or 0.0
+        result["price"] = clean_price(price_without_reduction, decimals) or 0.0
     else:
         price_amount = data.get("price_amount")
         if price_amount:
@@ -194,7 +194,7 @@ def extract_prices_from_json(
     
     current_price = data.get(discount_field)
     if current_price:
-        result["discount_price"] = clean_price_tunisianet(current_price, decimals) or 0.0
+        result["discount_price"] = clean_price(current_price, decimals) or 0.0
     else:
         price_amount = data.get("price_amount")
         if price_amount:
@@ -202,7 +202,7 @@ def extract_prices_from_json(
     
     reduction = data.get(reduction_field)
     if reduction:
-        result["discount_amount"] = clean_price_tunisianet(reduction, decimals) or 0.0
+        result["discount_amount"] = clean_price(reduction, decimals) or 0.0
         result["has_discount"] = True
         
         if result["price"] > 0 and result["discount_amount"] > 0:
@@ -247,7 +247,7 @@ def extract_prices_from_html(soup: BeautifulSoup) -> dict:
     regular_price_element = prices_container.select_one(".regular-price")
     if regular_price_element:
         regular_price_text = regular_price_element.text.strip()
-        result["price"] = clean_price_tunisianet(regular_price_text)
+        result["price"] = clean_price(regular_price_text)
         result["has_discount"] = True
         
         discount_amount_element = prices_container.select_one(".discount-amount")
@@ -255,13 +255,13 @@ def extract_prices_from_html(soup: BeautifulSoup) -> dict:
             discount_text = discount_amount_element.text.strip()
             match = re.search(r'(\d+[\.,]?\d*)', discount_text)
             if match:
-                result["discount_amount"] = clean_price_tunisianet(match.group(1))
+                result["discount_amount"] = clean_price(match.group(1))
     
     current_price_element = prices_container.select_one(".current-price .price, .current-price span[itemprop='price']")
     if current_price_element:
         current_price_text = current_price_element.text.strip()
         current_price_text = current_price_text.replace("TTC", "").strip()
-        result["discount_price"] = clean_price_tunisianet(current_price_text)
+        result["discount_price"] = clean_price(current_price_text)
     
     if not result["has_discount"] and result["discount_price"]:
         result["price"] = result["discount_price"]
@@ -294,7 +294,7 @@ def parse_prices(data: dict, soup: BeautifulSoup) -> dict:
     if price_element:
         price_text = price_element.get("content") or price_element.text.strip()
         result = {
-            "price": clean_price_tunisianet(price_text) or 0.0,
+            "price": clean_price(price_text) or 0.0,
             "discount_price": 0.0,
             "discount_amount": 0.0,
             "has_discount": False

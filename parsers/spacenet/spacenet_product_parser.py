@@ -1,14 +1,33 @@
 # parsers/spacenet/spacenet_product_parser.py
+"""
+Spacenet product parser.
+
+Price comes from the JSON-LD Product block; the HTML
+`.product-prices` block is used when the JSON carries no price or
+to recover a strikethrough original. All price strings are
+normalized through `core.utils.price_cleaner`.
+
+Storage contract:
+    price           = original (strikethrough / "was") price
+    discount_price  = discounted price (what the user pays), 0.0 if no discount
+    discount_amount = price - discount_price (positive), 0.0 if no discount
+"""
+from __future__ import annotations
 
 import json
 import re
-from typing import Dict, Any, Optional, List, Union, Set
-from bs4 import BeautifulSoup
 from datetime import datetime
+from typing import Any, Dict, Optional
+
+from bs4 import BeautifulSoup
+
 from core.logger import setup_logger
 from core.Web.product_schema import create_product_schema
-from core.utils.price_cleaner import clean_price, clean_price_tunisianet
-from core.utils.clean_text_parser import clean_and_decode_text, normalize_availability
+from core.utils.price_cleaner import clean_price
+from core.utils.clean_text_parser import (
+    clean_and_decode_text,
+    normalize_availability,
+)
 from core.utils.Dclean_html import clean_html
 from core.utils.cleaning_url_logic import normalize_url
 from core.utils.clean_date_logic import clean_date
@@ -16,340 +35,337 @@ from core.utils.clean_date_logic import clean_date
 logger = setup_logger("spacenet", "scraper")
 
 
-def parse_spacenet_product_page(html: str, url: str, site_name: str, product_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+# ═══════════════════════════════════════════════════════════
+# Helpers
+# ═══════════════════════════════════════════════════════════
+def _to_float(value: Any) -> Optional[float]:
+    """Run any price-ish value through clean_price, guarding None/empty."""
+    if value is None:
+        return None
+    cleaned = clean_price(value)
+    return cleaned if cleaned and cleaned > 0 else None
+
+
+def _same_magnitude(
+    reference: Optional[float], value: Optional[float]
+) -> Optional[float]:
     """
-    Parse Spacenet product page using utility functions for cleaning.
-    ALWAYS returns a dictionary or None. NEVER returns a set.
+    Normalize `value` so it lives on the same magnitude as `reference`.
+
+    Spacenet renders the JSON-LD price in dinars (e.g. 1169.0) while
+    the HTML strikethrough block renders it in millimes
+    (e.g. 1369000). This helper rescales the HTML value to match the
+    JSON value's magnitude so the two can be compared / subtracted.
     """
-    # =====================================================
-    # STEP 1: Validate HTML input
-    # =====================================================
+    if reference is None or value is None:
+        return value
+    if reference <= 0 or value <= 0:
+        return value
+    ratio = value / reference
+    if ratio >= 100:                 # value is ~1000x larger → millimes
+        return round(value / 1000.0, 2)
+    if ratio <= 0.01:                # value is ~1000x smaller → dinars
+        return round(value * 1000.0, 2)
+    return value
+
+
+# ═══════════════════════════════════════════════════════════
+# Main parser
+# ═══════════════════════════════════════════════════════════
+def parse_spacenet_product_page(
+    html: str,
+    url: str,
+    site_name: str,
+    product_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
     if not html:
         logger.warning(f"{site_name} | EMPTY_HTML | {url}")
         return None
-    
+
     try:
         soup = BeautifulSoup(html, "lxml")
     except Exception as e:
         logger.error(f"{site_name} | BEAUTIFULSOUP_ERROR | {url} | {e}")
         return None
 
-    # =====================================================
-    # STEP 2: Initialize product with schema
-    # =====================================================
     try:
         product = create_product_schema(site_name, url, product_id)
     except Exception as e:
         logger.error(f"{site_name} | CREATE_SCHEMA_ERROR | {url} | {e}")
         return None
-    
-    # =====================================================
-    # STEP 3: CRITICAL - Validate product type
-    # =====================================================
-    if product is None:
-        logger.error(f"{site_name} | SCHEMA_RETURNED_NONE | {url}")
-        return None
-    
-    # Check if product is a set (the problem we're fixing)
-    if isinstance(product, set):
-        logger.error(f"{site_name} | SCHEMA_RETURNED_SET | {url} | product is a set")
-        try:
-            for item in product:
-                if isinstance(item, dict):
-                    product = item
-                    logger.info(f"{site_name} | SCHEMA_SET_CONVERTED | {url}")
-                    break
-        except:
-            pass
-        if isinstance(product, set):
-            return None
-    
+
     if not isinstance(product, dict):
-        logger.error(f"{site_name} | SCHEMA_NOT_DICT | {url} | type={type(product)}")
+        logger.error(
+            f"{site_name} | SCHEMA_NOT_DICT | {url} | type={type(product)}"
+        )
         return None
-    
-    # =====================================================
-    # STEP 4: Set basic product fields
-    # =====================================================
+
     product["url"] = normalize_url(url)
     product["main_product_id"] = product_id
 
-    # =====================================================
-    # STEP 5: Extract JSON-LD Product Script
-    # =====================================================
-    product_json = None
-    scripts = soup.find_all("script", type="application/ld+json")
-    for script in scripts:
+    # ── Locate the Product JSON-LD block.
+    product_json: Optional[Dict] = None
+    for script in soup.find_all("script", type="application/ld+json"):
+        if not script.string:
+            continue
         try:
-            if script.string:
-                data = json.loads(script.string)
-                if data.get("@type") == "Product":
-                    product_json = data
-                    break
-                # Also check for @graph containing Product
-                elif data.get("@graph"):
-                    for item in data.get("@graph", []):
-                        if item.get("@type") == "Product":
-                            product_json = item
-                            break
-        except Exception as e:
+            data = json.loads(script.string)
+        except json.JSONDecodeError as e:
             logger.debug(f"{site_name} | JSON parse error | {e}")
+            continue
+        if isinstance(data, dict):
+            if data.get("@type") == "Product":
+                product_json = data
+                break
+            for item in data.get("@graph", []):
+                if isinstance(item, dict) and item.get("@type") == "Product":
+                    product_json = item
+                    break
+            if product_json is not None:
+                break
 
-    # =====================================================
-    # STEP 6: If no JSON-LD found, extract from HTML
-    # =====================================================
-    if not product_json:
+    # ── HTML-only fallback: name + price from the DOM.
+    if product_json is None:
         logger.warning(f"{site_name} | PRODUCT_JSON_NOT_FOUND | {url}")
-        
-        # Extract product name from HTML
-        name_elem = soup.find("h1", class_="product-name")
-        if not name_elem:
-            name_elem = soup.find("h1")
-        
-        if name_elem:
-            product["name"] = clean_and_decode_text(name_elem.text)
-        else:
+        name_el = soup.find("h1", class_="product-name") or soup.find("h1")
+        if not name_el:
             logger.warning(f"{site_name} | NO_PRODUCT_NAME | {url}")
             return None
-        
-        # Extract price from HTML using price_cleaner
-        price_elem = soup.find("span", class_="price")
-        if price_elem:
-            product["price"] = clean_price(price_elem.text.strip())
-        else:
-            product["price"] = 0
-        
-        # Extract availability using normalize_availability
-        avail_elem = soup.find("span", class_="availability")
-        if avail_elem:
-            product["availability"] = normalize_availability(avail_elem.text)
-        else:
-            product["availability"] = "OutOfStock"
-        
-        # Validate
-        if not product.get("name") or product.get("price", 0) <= 0:
-            logger.warning(f"{site_name} | INVALID_PRODUCT_NO_DATA | {url}")
+        product["name"] = clean_and_decode_text(name_el.text)
+
+        price_el = soup.find("span", class_="price")
+        raw_price = _to_float(price_el.text) if price_el else None
+
+        product["price"] = raw_price or 0.0
+        product["discount_price"] = 0.0
+        product["discount_amount"] = 0.0
+
+        avail_el = soup.find("span", class_="availability")
+        product["availability"] = (
+            normalize_availability(avail_el.text)
+            if avail_el else "OutOfStock"
+        )
+
+        if not product.get("name") or product["price"] <= 0:
+            logger.warning(
+                f"{site_name} | INVALID_PRODUCT_NO_DATA | {url}"
+            )
             return None
-        
-        # FINAL VALIDATION for HTML fallback
-        if isinstance(product, set):
-            logger.error(f"{site_name} | FALLBACK_PRODUCT_IS_SET | {url}")
-            return None
-        
-        if not isinstance(product, dict):
-            logger.error(f"{site_name} | FALLBACK_PRODUCT_NOT_DICT | {url} | type={type(product)}")
-            return None
-        
         return product
 
-    # =====================================================
-    # STEP 7: Extract Base Fields from JSON
-    # =====================================================
+    # ── Descriptive fields from JSON.
     product["name"] = clean_and_decode_text(product_json.get("name", ""))
-    product["brand"] = clean_and_decode_text(product_json.get("brand", {}).get("name")) if isinstance(product_json.get("brand"), dict) else clean_and_decode_text(product_json.get("brand"))
+    brand = product_json.get("brand")
+    if isinstance(brand, dict):
+        product["brand"] = clean_and_decode_text(brand.get("name"))
+    else:
+        product["brand"] = clean_and_decode_text(brand)
     product["category"] = clean_and_decode_text(product_json.get("category"))
-    
+
     if not product_id:
-        product["main_product_id"] = product_json.get("productID") or product_json.get("sku")
-        if product["main_product_id"]:
-            product["main_product_id"] = str(product["main_product_id"])
+        pid = product_json.get("productID") or product_json.get("sku")
+        if pid:
+            product["main_product_id"] = str(pid)
 
     product["special_id"] = clean_and_decode_text(product_json.get("sku"))
     product["description"] = clean_html(product_json.get("description", ""))
-    
-    # Extract images
+
     images = product_json.get("image")
     if images:
         if isinstance(images, str):
             images = [images]
-        product["images"] = [normalize_url(img) for img in images if img]
-        product["main_image"] = product["images"][0] if product["images"] else None
+        product["images"] = [normalize_url(i) for i in images if i]
+        product["main_image"] = (
+            product["images"][0] if product["images"] else None
+        )
 
-    # =====================================================
-    # STEP 8: Price Extraction from HTML using price_cleaner
-    # =====================================================
+    # ── PRICE LOGIC.
+    #
+    # Storage contract:
+    #   price           = original (strikethrough) price
+    #   discount_price  = discounted price (what the user pays), 0.0 if none
+    #   discount_amount = price - discount_price, positive, 0.0 if none
+    #
+    # JSON-LD carries the *current* price. The HTML `.product-prices`
+    # block carries the strikethrough original (and sometimes the
+    # current), in millimes — so we rescale it to match the JSON
+    # magnitude before comparing.
+    offers = product_json.get("offers", {})
+    if isinstance(offers, list) and offers:
+        offers = offers[0]
+
+    json_price: Optional[float] = None
+    if isinstance(offers, dict):
+        json_price = _to_float(offers.get("price"))
+
     price_block = soup.find("div", {"class": "product-prices"})
-
-    product["price"] = 0.0
-    product["discount_price"] = 0.0
-    product["discount_amount"] = 0.0
+    html_current: Optional[float] = None
+    html_original: Optional[float] = None
 
     if price_block:
-        discounted_div = price_block.find("div", {"class": "product-price has-discount"})
-        
-        if discounted_div:
-            # Current discounted price
-            current_price_div = discounted_div.find("div", {"class": "current-price"})
-            if current_price_div:
-                discount_price_span = current_price_div.find("span", {"content": True})
-                if discount_price_span:
-                    product["discount_price"] = clean_price(discount_price_span.text)
-                
-                discount_amount_span = current_price_div.find("span", {"class": "discount discount-amount"})
-                if discount_amount_span:
-                    product["discount_amount"] = clean_price(discount_amount_span.text)
-            
-            # Original/regular price
-            regular_price_div = price_block.find("div", {"class": "product-discount"})
-            if regular_price_div:
-                regular_price_span = regular_price_div.find("span", {"class": "regular-price"})
-                if regular_price_span:
-                    product["price"] = clean_price(regular_price_span.text)
-        else:
-            # No discount, fallback to JSON script price
-            offers = product_json.get("offers", {})
-            if isinstance(offers, dict):
-                product["price"] = clean_price(offers.get("price", 0))
-            elif isinstance(offers, list) and len(offers) > 0:
-                product["price"] = clean_price(offers[0].get("price", 0))
-            else:
-                product["price"] = 0
+        discounted = price_block.find(
+            "div", {"class": "product-price has-discount"}
+        )
+        if discounted:
+            current_div = discounted.find(
+                "div", {"class": "current-price"}
+            )
+            if current_div:
+                span = current_div.find("span", {"content": True})
+                if span:
+                    html_current = _to_float(
+                        span.get("content") or span.text
+                    )
+                else:
+                    amount_span = current_div.find(
+                        "span", {"class": "discount discount-amount"}
+                    )
+                    if amount_span:
+                        html_current = _to_float(amount_span.text)
 
-    # =====================================================
-    # STEP 9: If price is still 0, try to extract from JSON again
-    # =====================================================
-    if product["price"] == 0:
-        offers = product_json.get("offers", {})
-        if isinstance(offers, dict):
-            product["price"] = clean_price(offers.get("price", 0))
-        elif isinstance(offers, list) and len(offers) > 0:
-            product["price"] = clean_price(offers[0].get("price", 0))
+            regular_div = price_block.find(
+                "div", {"class": "product-discount"}
+            )
+            if regular_div:
+                span = regular_div.find(
+                    "span", {"class": "regular-price"}
+                )
+                if span:
+                    html_original = _to_float(span.text)
 
-    # =====================================================
-    # STEP 10: Validate product has required fields
-    # =====================================================
+    # Reconcile units: JSON-LD (dinars) vs HTML (millimes).
+    reference = json_price if json_price is not None else html_current
+    html_current = _same_magnitude(reference, html_current)
+    html_original = _same_magnitude(reference, html_original)
+
+    # Resolve which value is the "current" (discounted) price and
+    # which is the "original" (strikethrough) price.
+    # JSON price is authoritative for the current price when present.
+    if json_price is not None and json_price > 0:
+        discounted_price = json_price
+    elif html_current is not None and html_current > 0:
+        discounted_price = html_current
+    else:
+        discounted_price = None
+
+    original_price = html_original if html_original and html_original > 0 else None
+
+    # If the "original" isn't actually higher than the discounted price,
+    # there's no real discount — collapse to a single price.
+    if (
+        original_price is not None
+        and discounted_price is not None
+        and original_price <= discounted_price
+    ):
+        original_price = None
+
+    # No discount case: price = discounted (current) price, discount = 0.
+    if original_price is None:
+        original_price = discounted_price
+        discounted_price = None
+
+    # Final normalized values via clean_price.
+    price_value = _to_float(original_price) or 0.0
+
+    if discounted_price is not None and discounted_price < price_value:
+        discount_price_value = _to_float(discounted_price) or 0.0
+        discount_amount_value = round(
+            max(price_value - discount_price_value, 0.0), 2
+        )
+    else:
+        discount_price_value = 0.0
+        discount_amount_value = 0.0
+
+    product["price"] = round(price_value, 2)
+    product["discount_price"] = round(discount_price_value, 2)
+    product["discount_amount"] = discount_amount_value
+
+    # ── Validate.
     if not product.get("name"):
         logger.warning(f"{site_name} | INVALID_PRODUCT_NO_NAME | {url}")
         return None
-    
     if product["price"] <= 0:
-        # Try one more time from HTML using price_cleaner
-        price_elem = soup.find("span", class_="price")
-        if price_elem:
-            try:
-                product["price"] = clean_price(price_elem.text.strip())
-            except:
-                pass
-        
-        if product["price"] <= 0:
-            logger.warning(f"{site_name} | INVALID_PRODUCT_NO_PRICE | {url}")
-            return None
-
-    # =====================================================
-    # STEP 11: Extract Availability using normalize_availability
-    # =====================================================
-    offers = product_json.get("offers", {})
-    if isinstance(offers, dict):
-        availability = offers.get("availability")
-        if availability:
-            product["availability"] = normalize_availability(availability.split("/")[-1])
-    elif isinstance(offers, list) and len(offers) > 0:
-        availability = offers[0].get("availability")
-        if availability:
-            product["availability"] = normalize_availability(availability.split("/")[-1])
-
-    if not product.get("availability"):
-        avail_elem = soup.find("span", class_="availability")
-        if avail_elem:
-            product["availability"] = normalize_availability(avail_elem.text)
-        else:
-            product["availability"] = "OutOfStock"
-
-    # =====================================================
-    # STEP 12: Price Valid Until - using clean_date
-    # =====================================================
-    valid_until = None
-    if isinstance(offers, dict):
-        valid_until = offers.get("priceValidUntil")
-    elif isinstance(offers, list) and len(offers) > 0:
-        valid_until = offers[0].get("priceValidUntil")
-    
-    if valid_until:
-        product["price_valid_until"] = clean_date(valid_until)
-
-    # =====================================================
-    # STEP 13: Special ID fallback
-    # =====================================================
-    if not product.get("special_id"):
-        reference_elem = soup.find("span", class_="product-reference")
-        if reference_elem:
-            product["special_id"] = clean_and_decode_text(reference_elem.text)
-        
-        # Try from meta
-        if not product.get("special_id"):
-            sku_meta = soup.find("meta", {"property": "product:retailer_item_id"})
-            if sku_meta:
-                product["special_id"] = clean_and_decode_text(sku_meta.get("content", ""))
-
-    # =====================================================
-    # STEP 14: Extract Short Description from attributes table
-    # =====================================================
-    if not product.get("short_description"):
-        product["short_description"] = {}
-    
-    # Try to extract specs from table
-    specs_table = soup.find("table", class_="data table additional-attributes")
-    if specs_table:
-        rows = specs_table.find_all("tr")
-        for row in rows:
-            th = row.find("th")
-            td = row.find("td")
-            if th and td:
-                key = clean_and_decode_text(th.text)
-                value = clean_and_decode_text(td.text)
-                if key and value:
-                    product["short_description"][key] = value
-
-    # =====================================================
-    # STEP 15: FINAL VALIDATION - Ensure we return a dict
-    # =====================================================
-    if isinstance(product, set):
-        logger.error(f"{site_name} | FINAL_PRODUCT_IS_SET | {url} | product is a set")
-        try:
-            for item in product:
-                if isinstance(item, dict):
-                    product = item
-                    logger.info(f"{site_name} | FINAL_SET_CONVERTED | {url}")
-                    break
-        except:
-            pass
-        if isinstance(product, set):
-            return None
-    
-    if not isinstance(product, dict):
-        logger.error(f"{site_name} | FINAL_PRODUCT_NOT_DICT | {url} | type={type(product)}")
+        logger.warning(
+            f"{site_name} | INVALID_PRODUCT_NO_PRICE | {url}"
+        )
         return None
 
-    # =====================================================
-    # STEP 16: Log success and return
-    # =====================================================
-    logger.debug(f"{site_name} | PRODUCT_PARSED | {product.get('name', 'Unknown')[:50]}...")
-    
+    # ── Availability.
+    if isinstance(offers, dict):
+        avail = offers.get("availability")
+        if avail:
+            product["availability"] = normalize_availability(
+                avail.split("/")[-1]
+            )
+    if not product.get("availability"):
+        avail_el = soup.find("span", class_="availability")
+        product["availability"] = (
+            normalize_availability(avail_el.text)
+            if avail_el else "OutOfStock"
+        )
+
+    # ── Price valid until.
+    if isinstance(offers, dict) and offers.get("priceValidUntil"):
+        product["price_valid_until"] = clean_date(
+            offers["priceValidUntil"]
+        )
+
+    # ── Special ID fallback.
+    if not product.get("special_id"):
+        ref = soup.find("span", class_="product-reference")
+        if ref:
+            product["special_id"] = clean_and_decode_text(ref.text)
+        if not product.get("special_id"):
+            meta = soup.find(
+                "meta", {"property": "product:retailer_item_id"}
+            )
+            if meta:
+                product["special_id"] = clean_and_decode_text(
+                    meta.get("content", "")
+                )
+
+    # ── Specs.
+    product["short_description"] = {}
+    specs_table = soup.find(
+        "table", class_="data table additional-attributes"
+    )
+    if specs_table:
+        for row in specs_table.find_all("tr"):
+            th, td = row.find("th"), row.find("td")
+            if not th or not td:
+                continue
+            key = clean_and_decode_text(th.text)
+            value = clean_and_decode_text(td.text)
+            if key and value:
+                product["short_description"][key] = value
+
+    logger.debug(
+        f"{site_name} | PRODUCT_PARSED | "
+        f"{product.get('name', 'Unknown')[:50]}..."
+    )
     return product
 
 
-def fast_check_spacenet_product(url: str, product_id: str = None) -> Optional[Dict[str, Any]]:
-    """
-    Quick check function for Spacenet products using utility functions.
-    """
-    from core.Web.http_client import get
-    
+def fast_check_spacenet_product(
+    url: str, product_id: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
+    """Monitoring helper (fetch + parse)."""
+    from core.Web.smart_requester import SmartRequester
+
     try:
-        html = get(
-            url=url,
-            max_retries=4,
-            timeout=45,
-            requests_per_minute=10,
-            use_referer=True,
-            verify_ssl=True
+        html = SmartRequester(site_name="spacenet").get_html(
+            url, timeout=45
         )
-        
         if not html:
-            logger.warning(f"SPACENET_FAST | FETCH_FAILED | product_id={product_id}")
+            logger.warning(
+                f"SPACENET_FAST | FETCH_FAILED | id={product_id}"
+            )
             return None
-        
-        return parse_spacenet_product_page(html, url, "spacenet", product_id)
-        
+        return parse_spacenet_product_page(
+            html, url, "spacenet", product_id
+        )
     except Exception as e:
-        logger.error(f"SPACENET_FAST | CHECK_ERROR | product_id={product_id} | {e}")
+        logger.error(
+            f"SPACENET_FAST | CHECK_ERROR | id={product_id} | {e}"
+        )
         return None
