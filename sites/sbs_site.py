@@ -199,7 +199,6 @@ class SBSSite(BaseSite):
     
     def parse_product(self, url, product_id):
         html = self.safe_get(url)
-        logger.warning(f"html : {html}")
         if not html:
             return None
 
@@ -233,8 +232,6 @@ class SBSSite(BaseSite):
                 return None
 
             details = self.parse_product(product_url, product_id)
-            logger.warning(f"\n details : {details}")
-
             if not details:
                 logger.warning(f"{self.name} | PARSE_FAILED | {product_id}")
                 with self.lock:
